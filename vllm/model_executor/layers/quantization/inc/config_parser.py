@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+#from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 if TYPE_CHECKING:
@@ -41,6 +42,10 @@ class INCLayerConfig:
         return "mx_fp" in self.data_type and self.bits == 4
 
     @property
+    def is_nvfp4(self) -> bool:
+        return self.data_type == "nv_fp" and self.bits == 4
+
+    @property
     def is_mxfp8(self) -> bool:
         return "mx_fp" in self.data_type and self.bits == 8
 
@@ -50,16 +55,22 @@ class INCConfigParser:
         self._config = config
 
     def resolve(self, layer: "torch.nn.Module", layer_name: str) -> INCLayerConfig:
-        bits, group_size, sym = self._resolve_raw(layer, layer_name)
-        return INCLayerConfig(
+        bits, group_size, sym, data_type = self._resolve_raw(layer, layer_name)
+        layer_config = INCLayerConfig(
             bits=bits,
             group_size=group_size,
             sym=sym,
             packing_format=self._config.packing_format,
             backend=self._config.backend,
-            data_type=self._config.data_type,
+            data_type=data_type,
             quantized=bits < 16,
         )
+        if layer_config.is_nvfp4:
+            if layer_config.group_size != 16:
+                raise ValueError("NVFP4 requires group_size=16")
+            if not layer_config.sym:
+                raise ValueError("NVFP4 requires symmetric weights")
+        return layer_config
 
     def get_layer_config(
         self, layer: "torch.nn.Module", layer_name: str
@@ -69,7 +80,7 @@ class INCConfigParser:
 
     def _resolve_raw(
         self, layer: "torch.nn.Module", layer_name: str
-    ) -> tuple[int, int, bool]:
+    ) -> tuple[int, int, bool, str]:
         REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
 
         def is_explicitly_configured(name: str) -> bool:
@@ -91,12 +102,15 @@ class INCConfigParser:
                     continue
             return False
 
-        def get_config(name: str, quantized: bool = True) -> tuple[int, int, bool]:
+        def get_config(
+            name: str, quantized: bool = True
+        ) -> tuple[int, int, bool, str]:
             if not self._config.extra_config:
                 return (
                     self._config.weight_bits if quantized else 16,
                     self._config.group_size if quantized else -1,
                     self._config.sym if quantized else True,
+                    self._config.data_type if quantized else "float",
                 )
 
             if name in self._config.extra_config:
@@ -108,6 +122,9 @@ class INCConfigParser:
                         self._config.group_size if quantized else -1,
                     ),
                     cfg.get("sym", self._config.sym if quantized else True),
+                    cfg.get(
+                        "data_type", self._config.data_type if quantized else "float"
+                    ),
                 )
 
             regex_special_chars = set(r"*+?^$()[]{}|\\")
@@ -129,6 +146,10 @@ class INCConfigParser:
                                 self._config.group_size if quantized else -1,
                             ),
                             cfg.get("sym", self._config.sym if quantized else True),
+                            cfg.get(
+                                "data_type",
+                                self._config.data_type if quantized else "float",
+                            ),
                         )
                 except re.error:
                     continue
@@ -137,6 +158,7 @@ class INCConfigParser:
                 self._config.weight_bits if quantized else 16,
                 self._config.group_size if quantized else -1,
                 self._config.sym if quantized else True,
+                self._config.data_type if quantized else "float",
             )
 
         if self._config.extra_config and layer_name in self._config.extra_config:

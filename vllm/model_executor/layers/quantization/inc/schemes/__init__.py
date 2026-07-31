@@ -4,6 +4,7 @@
 from .factory import resolve_scheme
 from .inc_mxfp4_scheme import INCMxfp4Scheme
 from .inc_mxfp8_scheme import INCMxfp8Scheme
+from .inc_nvfp4_scheme import INCNvfp4Scheme
 from .inc_scheme import INCLinearScheme, INCScheme
 from .inc_wna16_scheme import INCWna16Scheme
 
@@ -13,5 +14,6 @@ __all__ = [
     "INCMxfp8Scheme",
     "INCWna16Scheme",
     "INCMxfp4Scheme",
+    "INCNvfp4Scheme",
     "resolve_scheme",
 ]

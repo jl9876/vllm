@@ -36,6 +36,8 @@ class INCConfig(QuantizationConfig):
 
     SUPPORTED_BITS = {2, 3, 4, 8}
     SUPPORTED_DTYPES = {"int", "mx_fp"}
+    NVFP4_DTYPES = {"nv_fp"}
+    NVFP4_ACT_DTYPES = {"nv_fp4_with_static_gs"}
     SUPPORTED_FORMATS = {
         "auto_round:auto_gptq",
         "auto_round:auto_awq",
@@ -65,6 +67,11 @@ class INCConfig(QuantizationConfig):
         extra_config: dict[str, Any] | None = None,
         data_type: str = "int",
         backend: str = "auto",
+        act_bits: int | None = None,
+        act_group_size: int | None = None,
+        act_data_type: str | None = None,
+        act_sym: bool | None = None,
+        act_dynamic: bool | None = None,
     ) -> None:
         super().__init__()
         if weight_bits not in self.SUPPORTED_BITS:
@@ -75,11 +82,35 @@ class INCConfig(QuantizationConfig):
         # auto-round mxfp data_type is e.g. "mx_fp4" / "mx_fp4e2m1"; match the
         # "mx_fp" family by substring like auto_round.compressors.is_mx_fp.
         is_mxfp = "mx_fp" in data_type
-        if data_type not in self.SUPPORTED_DTYPES and not is_mxfp:
+        is_nvfp4 = data_type in self.NVFP4_DTYPES
+        if data_type not in self.SUPPORTED_DTYPES and not is_mxfp and not is_nvfp4:
             raise ValueError(
                 f"Unsupported data_type: {data_type}, "
                 f"currently only support {self.SUPPORTED_DTYPES}."
             )
+        if is_nvfp4:
+            if weight_bits != 4:
+                raise ValueError("NVFP4 requires 4-bit weights")
+            if group_size != 16:
+                raise ValueError("NVFP4 requires group_size=16")
+            if not sym:
+                raise ValueError("NVFP4 requires symmetric weights")
+            if act_bits != 4:
+                raise ValueError("NVFP4 requires 4-bit activations")
+            if act_group_size != 16:
+                raise ValueError("NVFP4 requires activation group_size=16")
+            if act_data_type not in self.NVFP4_ACT_DTYPES:
+                raise ValueError(
+                    "NVFP4 activation data_type must be nv_fp4_with_static_gs"
+                )
+            if act_sym is not True:
+                raise ValueError("NVFP4 requires symmetric activations")
+            if act_dynamic is not True:
+                raise ValueError("NVFP4 requires dynamic activation quantization")
+            if packing_format != "auto_round:llm_compressor":
+                raise ValueError(
+                    "NVFP4 requires packing_format=auto_round:llm_compressor"
+                )
         if packing_format not in self.SUPPORTED_FORMATS:
             raise ValueError(
                 f"Unsupported packing_format: {packing_format}, "
@@ -103,6 +134,11 @@ class INCConfig(QuantizationConfig):
         self.extra_config = extra_config
         self.data_type = data_type
         self.backend = backend
+        self.act_bits = act_bits
+        self.act_group_size = act_group_size
+        self.act_data_type = act_data_type
+        self.act_sym = act_sym
+        self.act_dynamic = act_dynamic
         self.pack_factor = Fraction(32, weight_bits)
         self.config_parser = INCConfigParser(self)
 
@@ -141,7 +177,11 @@ class INCConfig(QuantizationConfig):
                 "INC MXFP8 only supports backend='auto', "
                 f"but found backend={self.backend!r}."
             )
-        elif self.packing_format == self.MXFP8_PACKING_FORMAT and not self.is_mxfp:
+        elif (
+            self.packing_format == self.MXFP8_PACKING_FORMAT
+            and not self.is_mxfp
+            and self.data_type not in self.NVFP4_DTYPES
+        ):
             raise ValueError(
                 f"packing_format={self.MXFP8_PACKING_FORMAT!r} requires "
                 f"an {self.MXFP8_DATA_TYPE!r} data_type."
@@ -198,6 +238,11 @@ class INCConfig(QuantizationConfig):
             extra_config=cls.get_from_keys_or(config, ["extra_config"], None),
             data_type=cls.get_from_keys_or(config, ["data_type"], "int"),
             backend=cls.get_from_keys_or(config, ["backend", "vllm_backend"], "auto"),
+            act_bits=cls.get_from_keys_or(config, ["act_bits"], None),
+            act_group_size=cls.get_from_keys_or(config, ["act_group_size"], None),
+            act_data_type=cls.get_from_keys_or(config, ["act_data_type"], None),
+            act_sym=cls.get_from_keys_or(config, ["act_sym"], None),
+            act_dynamic=cls.get_from_keys_or(config, ["act_dynamic"], None),
         )
         quant_config._validate_raw_config(config)
         return quant_config

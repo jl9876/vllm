@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMeth
 from vllm.model_executor.layers.quantization.inc.schemes import (
     INCMxfp4Scheme,
     INCMxfp8Scheme,
+    INCNvfp4Scheme,
     INCWna16Scheme,
     resolve_scheme,
 )
@@ -448,6 +449,268 @@ def test_inc_layer_config_mx_fp_helpers() -> None:
 
     assert layer_config.is_mxfp4 is True
     assert layer_config.is_mxfp8 is False
+
+
+def test_inc_layer_config_nvfp4_helper() -> None:
+    layer_config = make_layer_config(
+        group_size=16,
+        packing_format="auto_round:llm_compressor",
+        data_type="nv_fp",
+    )
+
+    assert layer_config.is_nvfp4 is True
+    assert layer_config.is_mxfp4 is False
+
+
+def test_inc_rejects_unknown_nvfp4_alias() -> None:
+    with pytest.raises(ValueError, match="Unsupported data_type"):
+        make_config(data_type="nvfp4")
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "error"),
+    [
+        ({"group_size": 32}, "group_size=16"),
+        ({"sym": False}, "symmetric"),
+    ],
+)
+def test_inc_nvfp4_layer_override_validation(
+    extra_config: dict, error: str
+) -> None:
+    config = make_config(
+        group_size=16,
+        packing_format="auto_round:llm_compressor",
+        data_type="nv_fp",
+        act_bits=4,
+        act_group_size=16,
+        act_data_type="nv_fp4_with_static_gs",
+        act_sym=True,
+        act_dynamic=True,
+        extra_config={"model.layers.0.mlp.down_proj": extra_config},
+    )
+
+    with pytest.raises(ValueError, match=error):
+        config.config_parser.resolve(
+            DummyLayer(), "model.layers.0.mlp.down_proj"
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "error"),
+    [
+        ({"weight_bits": 8}, "4-bit weights"),
+        ({"group_size": 32}, "group_size=16"),
+        ({"sym": False}, "symmetric"),
+        ({"act_bits": 8}, "4-bit activations"),
+        ({"act_group_size": 32}, "activation group_size=16"),
+        ({"act_data_type": "float"}, "NVFP4 activation data_type"),
+        ({"packing_format": "auto_round:auto_gptq"}, "packing_format"),
+    ],
+)
+def test_inc_nvfp4_config_validation(override: dict, error: str) -> None:
+    kwargs = {
+        "weight_bits": 4,
+        "group_size": 16,
+        "sym": True,
+        "packing_format": "auto_round:llm_compressor",
+        "data_type": "nv_fp",
+        "act_bits": 4,
+        "act_group_size": 16,
+        "act_data_type": "nv_fp4_with_static_gs",
+        "act_sym": True,
+        "act_dynamic": True,
+    }
+    kwargs.update(override)
+
+    with pytest.raises(ValueError, match=error):
+        INCConfig(**kwargs)
+
+
+def test_inc_accepts_autoround_nvfp4_config() -> None:
+    config = INCConfig.from_config({
+        "quant_method": "auto-round",
+        "bits": 4,
+        "group_size": 16,
+        "sym": True,
+        "packing_format": "auto_round:llm_compressor",
+        "data_type": "nv_fp",
+        "act_bits": 4,
+        "act_group_size": 16,
+        "act_data_type": "nv_fp4_with_static_gs",
+        "act_sym": True,
+        "act_dynamic": True,
+    })
+
+    layer_config = config.config_parser.resolve(
+        DummyLayer(), "model.layers.0.mlp.down_proj"
+    )
+
+    assert layer_config.is_nvfp4 is True
+    assert isinstance(resolve_scheme(layer_config), INCNvfp4Scheme)
+
+
+def test_inc_nvfp4_linear_method_registers_and_processes_weights(
+    monkeypatch,
+) -> None:
+    captured = {}
+
+    class DummyKernel:
+        def input_quant_key(self):
+            return None
+
+        def process_weights_after_loading(self, layer) -> None:
+            captured["processed_layer"] = layer
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes."
+        "inc_nvfp4_linear.init_nvfp4_linear_kernel",
+        lambda: DummyKernel(),
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    from vllm.model_executor.layers.quantization.inc.schemes.inc_nvfp4_linear import (  # noqa: E501
+        INCNvfp4LinearMethod,
+    )
+
+    layer = torch.nn.Module()
+    method = INCNvfp4LinearMethod(
+        make_layer_config(
+            group_size=16,
+            packing_format="auto_round:llm_compressor",
+            data_type="nv_fp",
+        )
+    )
+    method.create_weights(
+        layer,
+        input_size_per_partition=64,
+        output_partition_sizes=[16, 32],
+        input_size=64,
+        output_size=48,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.weight_packed.shape == (48, 32)
+    assert layer.weight_scale.shape == (48, 4)
+    assert layer.weight_scale.dtype is torch.float8_e4m3fn
+    assert layer.weight_global_scale.shape == (2,)
+    assert layer.input_global_scale.shape == (2,)
+    assert layer.weight_global_scale.needs_scalar_to_array is True
+    assert layer.input_global_scale.needs_scalar_to_array is True
+
+    layer.weight_global_scale.data.copy_(torch.tensor([4.0, 2.0]))
+    layer.input_global_scale.data.copy_(torch.tensor([8.0, 4.0]))
+    packed_data = layer.weight_packed.data
+    method.process_weights_after_loading(layer)
+
+    assert layer.weight.data.data_ptr() == packed_data.data_ptr()
+    assert not hasattr(layer, "weight_packed")
+    assert layer.weight_global_scale.item() == pytest.approx(0.25)
+    assert layer.input_global_scale.item() == pytest.approx(0.125)
+    assert layer.input_global_scale_inv.item() == pytest.approx(8.0)
+    assert layer.alpha.item() == pytest.approx(0.03125)
+    assert captured["processed_layer"] is layer
+
+
+def test_inc_nvfp4_moe_method_registers_weights_and_builds_kernel(
+    monkeypatch,
+) -> None:
+    captured = {}
+    expected_backend = object()
+    expected_quant_config = object()
+
+    class DummyMoeConfig:
+        is_act_and_mul = True
+
+    class DummyExperts:
+        @staticmethod
+        def is_monolithic() -> bool:
+            return False
+
+    class DummyFusedExperts:
+        def process_weights_after_loading(self, layer) -> None:
+            captured["processed_layer"] = layer
+
+    class DummyKernel:
+        fused_experts = DummyFusedExperts()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes.inc_nvfp4_moe."
+        "select_nvfp4_moe_backend",
+        lambda **kwargs: (expected_backend, DummyExperts),
+    )
+
+    def convert(**kwargs):
+        captured["convert_kwargs"] = kwargs
+        return (
+            kwargs["w13"],
+            kwargs["w13_scale"],
+            kwargs["w13_scale_2"],
+            kwargs["a13_scale"],
+            kwargs["w2"],
+            kwargs["w2_scale"],
+            kwargs["w2_scale_2"],
+            kwargs["a2_scale"],
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes.inc_nvfp4_moe."
+        "convert_to_nvfp4_moe_kernel_format",
+        convert,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes.inc_nvfp4_moe."
+        "make_nvfp4_moe_quant_config",
+        lambda **kwargs: captured.update({"quant_config_kwargs": kwargs})
+        or expected_quant_config,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes.inc_nvfp4_moe."
+        "make_nvfp4_moe_kernel",
+        lambda **kwargs: captured.update({"kernel_kwargs": kwargs}) or DummyKernel(),
+    )
+
+    from vllm.model_executor.layers.quantization.inc.schemes.inc_nvfp4_moe import (
+        INCNvfp4MoEMethod,
+    )
+
+    method = INCNvfp4MoEMethod(cast(Any, DummyMoeConfig()))
+    layer = torch.nn.Module()
+    layer._expert_routing_tables = lambda: "routing-tables"
+    method.create_weights(
+        layer,
+        num_experts=2,
+        hidden_size=64,
+        intermediate_size_per_partition=32,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.w13_weight_packed.shape == (2, 64, 32)
+    assert layer.w2_weight_packed.shape == (2, 64, 16)
+    assert layer.w13_weight_scale.shape == (2, 64, 4)
+    assert layer.w2_weight_scale.shape == (2, 64, 2)
+    assert layer.w13_weight_scale.dtype is torch.float8_e4m3fn
+    assert layer.w13_weight_global_scale.shape == (2, 2)
+    assert layer.w2_weight_global_scale.shape == (2,)
+
+    layer.w13_weight_global_scale.data.fill_(4.0)
+    layer.w2_weight_global_scale.data.fill_(8.0)
+    layer.w13_input_global_scale.data.fill_(16.0)
+    layer.w2_input_global_scale.data.fill_(32.0)
+    method.process_weights_after_loading(cast(Any, layer))
+
+    convert_kwargs = captured["convert_kwargs"]
+    torch.testing.assert_close(convert_kwargs["w13_scale_2"], torch.full((2,), 0.25))
+    torch.testing.assert_close(convert_kwargs["w2_scale_2"], torch.full((2,), 0.125))
+    torch.testing.assert_close(convert_kwargs["a13_scale"], torch.full((2, 2), 0.0625))
+    torch.testing.assert_close(convert_kwargs["a2_scale"], torch.full((2,), 0.03125))
+    assert captured["kernel_kwargs"]["backend"] is expected_backend
+    assert captured["kernel_kwargs"]["routing_tables"] == "routing-tables"
+    assert captured["processed_layer"] is layer
 
 
 def test_inc_resolve_scheme_selects_wna16() -> None:

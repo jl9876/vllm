@@ -24,8 +24,13 @@
 
 On Intel platforms, AutoRound recipes are being enabled progressively by format and hardware. Currently, vLLM supports:
 
-- **`W4A16`**: weight-only, 4-bit weights with 16-bit activations
-- **`W8A16`**: weight-only, 8-bit weights with 16-bit activations
+- **`NVFP4 W4A4`**: symmetric group-16 weights and dynamically quantized
+  group-16 activations exported with `auto_round:llm_compressor`
+
+NVFP4 linear and MoE layers use vLLM's platform kernel selectors. Native FP4
+execution requires a supported GPU and CUDA stack; unsupported devices fail with
+the kernel selector's capability error rather than silently changing the
+quantization format.
 
 Additional recipes and formats will be supported in future releases.
 
