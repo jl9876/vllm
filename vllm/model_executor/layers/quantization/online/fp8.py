@@ -135,10 +135,11 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
     def tie_weights(
         self, layer: torch.nn.Module, embed_tokens: torch.nn.Module
     ) -> torch.nn.Module:
-        del layer, embed_tokens
-        raise ValueError(
-            "Online-quantized lm_head cannot share weights with input embeddings."
-        )
+        if self.requantization_source is not None:
+            raise ValueError(
+                "A requantized lm_head cannot share weights with input embeddings."
+            )
+        return super().tie_weights(layer, embed_tokens)
 
     def get_weight_for_quantization(self, layer: torch.nn.Module) -> torch.Tensor:
         if self.requantization_source is None:

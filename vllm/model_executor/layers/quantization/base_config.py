@@ -216,6 +216,12 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError
 
+    def get_quant_method_for_requantization(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> QuantizeMethodBase | None:
+        """Return a checkpoint method used only as an online weight source."""
+        return self.get_quant_method(layer, prefix)
+
     @staticmethod
     def get_cache_scale_mapper() -> "WeightsMapper":
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
@@ -310,22 +316,31 @@ def resolve_quant_method(
     )
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-    base_quant_method = quant_config.get_quant_method(layer, prefix)
     if quant_config.online_quantization_config is None:
         # No online configuration: retain the checkpoint method.
-        return base_quant_method
+        return quant_config.get_quant_method(layer, prefix)
     # Ordinary embeddings must retain their embedding quantization method.
     if not isinstance(layer, (LinearBase, ParallelLMHead, RoutedExperts)):
-        return base_quant_method
+        return quant_config.get_quant_method(layer, prefix)
 
     quant_config.online_quantization_config.packed_modules_mapping = (
         quant_config.packed_modules_mapping
     )
-    checkpoint_is_quantized = base_quant_method is not None and not isinstance(
-        base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
-    )
     online_target = quant_config.online_quantization_config.resolve_quant_method_cls(
         type(layer), prefix
+    )
+    if online_target is None:
+        base_quant_method = quant_config.get_quant_method(layer, prefix)
+    else:
+        requantization_getter = getattr(
+            type(quant_config), "get_quant_method_for_requantization", None
+        )
+        if requantization_getter is None:
+            base_quant_method = quant_config.get_quant_method(layer, prefix)
+        else:
+            base_quant_method = requantization_getter(quant_config, layer, prefix)
+    checkpoint_is_quantized = base_quant_method is not None and not isinstance(
+        base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
     )
 
     if checkpoint_is_quantized:

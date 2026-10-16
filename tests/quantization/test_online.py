@@ -326,7 +326,7 @@ def test_modelopt_fp8_attention_loads_and_converts_to_mxfp8(
     torch.testing.assert_close(
         captured[0], torch.full((128, 128), 2.0, dtype=torch.bfloat16)
     )
-    assert "input_scale" not in layer._parameters
+    assert layer.input_scale is None
     assert layer.weight.shape == (128, 128)
     assert layer.weight_scale.shape == (128, 4)
     kernel.process_weights_after_loading.assert_called_once_with(layer)
@@ -436,7 +436,12 @@ def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
         down.quant_method.requantization_source, _ModelOptNvfp4LinearSource
     )
     head = ParallelLMHead(
-        130, 32, padding_size=64, disable_tp=True, quant_config=config, prefix="lm_head"
+        130,
+        32,
+        padding_size=64,
+        disable_tp=True,
+        quant_config=config,
+        prefix="language_model.lm_head",
     )
     assert isinstance(head.quant_method, Mxfp4OnlineLinearMethod)
     assert isinstance(
@@ -462,7 +467,7 @@ def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
         parameter = getattr(head, name)
         parameter.weight_loader(parameter, value)
     assert torch.count_nonzero(head.weight[130:]) == 0
-    assert torch.count_nonzero(head.weight_scale[130:]) == 0
+    assert torch.count_nonzero(head.weight_scale[130:].float()) == 0
     captured = []
 
     def quantize(weight):
@@ -480,7 +485,7 @@ def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
     assert captured[0].shape == (192, 32)
     assert torch.count_nonzero(captured[0][130:]) == 0
     assert "weight_scale_2" not in head._parameters
-    assert "input_scale" not in head._parameters
+    assert head.input_scale is None
     assert head.weight.shape == (192, 16)
     assert head.weight_scale.shape == (192, 1)
 
@@ -885,6 +890,50 @@ def test_online_quantization_configures_prequantized_moe(
 
     assert isinstance(layer._quant_method, Mxfp4OnlineMoEMethod)
     assert layer._quant_method.requantization_source is not None
+
+
+def test_modelopt_nvfp4_moe_source_does_not_require_execution_backend(
+    default_vllm_config, dist_init, monkeypatch
+) -> None:
+    default_vllm_config.model_config = ModelConfig()
+    prefix = "model.layers.0.mlp.experts"
+    quant_config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    prefix: {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    }
+                },
+            }
+        }
+    )
+    quant_config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(targets={prefix: "mxfp4"})
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.modelopt.select_nvfp4_moe_backend",
+        lambda **kwargs: pytest.fail(
+            "a requantization source must not select an execution backend"
+        ),
+    )
+
+    layer = FusedMoEFactory(
+        num_experts=4,
+        top_k=2,
+        hidden_size=32,
+        intermediate_size=64,
+        params_dtype=torch.bfloat16,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
+
+    assert isinstance(layer._quant_method, Mxfp4OnlineMoEMethod)
+    source = layer._quant_method.requantization_source
+    assert isinstance(source, ModelOptNvFp4FusedMoE)
+    assert source.nvfp4_backend is None
 
 
 def _pack_e2m1(values: torch.Tensor) -> torch.Tensor:

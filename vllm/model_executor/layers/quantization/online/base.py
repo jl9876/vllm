@@ -334,14 +334,28 @@ class OnlineQuantizationConfig(QuantizationConfig):
 
         """
         assert self.args.targets is not None
-        ignored = should_ignore_layer(
-            prefix,
-            ignore=self.ignored_layers,
-            fused_mapping=self.packed_modules_mapping,
-            use_fnmatch=True,
+        prefix_candidates = [prefix]
+        if issubclass(layer_cls, ParallelLMHead) and prefix.endswith(".lm_head"):
+            prefix_candidates.append("lm_head")
+        ignored = any(
+            should_ignore_layer(
+                candidate,
+                ignore=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+                use_fnmatch=True,
+            )
+            for candidate in prefix_candidates
         )
-        matches = _find_matching_targets(
-            prefix, self.args.targets, fused_mapping=self.packed_modules_mapping
+        matches = list(
+            dict.fromkeys(
+                match
+                for candidate in prefix_candidates
+                for match in _find_matching_targets(
+                    candidate,
+                    self.args.targets,
+                    fused_mapping=self.packed_modules_mapping,
+                )
+            )
         )
         if ignored and matches:
             raise ValueError(

@@ -851,6 +851,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
+        *,
+        requantization_source: bool = False,
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
@@ -870,6 +872,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                     "'nvfp4_per_token' or omit the override."
                 )
         self.per_token_activation = activation_key == kNvfp4DynamicToken
+
+        self.nvfp4_backend = None
+        self.experts_cls = None
+        if requantization_source:
+            self.use_global_sf = False
+            return
 
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
             config=self.moe,
@@ -1833,6 +1841,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        return self._get_quant_method(layer, prefix, requantization_source=False)
+
+    def get_quant_method_for_requantization(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        return self._get_quant_method(layer, prefix, requantization_source=True)
+
+    def _get_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+        *,
+        requantization_source: bool,
+    ) -> "QuantizeMethodBase | None":
         """Return quantize-method based on layer."""
         # KV-cache quantization
         if isinstance(layer, Attention):
@@ -1887,11 +1909,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.nvfp4_config,
                     moe_config=layer.moe_config,
+                    requantization_source=requantization_source,
                 )
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.w4a16_nvfp4_config,
                     moe_config=layer.moe_config,
+                    requantization_source=requantization_source,
                 )
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8FusedMoE(
