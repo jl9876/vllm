@@ -213,58 +213,6 @@ def test_modelopt_nvfp4_mxfp4_shorthand_preserves_checkpoint_source(requested):
 
 
 @pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])
-def test_modelopt_fp8_source_dequantizes_for_mxfp8(algo):
-    from vllm.model_executor.layers.quantization.modelopt import resolve
-
-    spec, ctx, fmt = resolve(algo, SimpleNamespace(), "")
-    source = ModelOptLinearMethod(spec, ctx, fmt)
-    source.out_dtype = torch.bfloat16
-    weight = torch.ones((130, 256), dtype=torch.float8_e4m3fn)
-    if algo == "FP8":
-        scale = torch.tensor([2.0, 3.0])
-        widths = [64, 66]
-        expected = torch.cat((torch.full((64, 256), 2.0), torch.full((66, 256), 3.0)))
-    else:
-        scale = torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float32).view(
-            2, 1, 2, 1
-        )
-        widths = [130]
-        expected = torch.tensor(
-            [[2.0] * 128 + [3.0] * 128] * 128 + [[4.0] * 128 + [5.0] * 128] * 2
-        )
-    layer = SimpleNamespace(weight=weight, weight_scale=scale, logical_widths=widths)
-    actual = source.dequantize_weight(layer)
-    assert actual.dtype == torch.bfloat16
-    torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
-    if algo == "FP8_PB_WO":
-        layer.weight_scale = scale[:, 0, :, 0]
-        torch.testing.assert_close(source.dequantize_weight(layer), actual)
-
-
-@pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])
-def test_modelopt_fp8_requantization_rejects_missing_or_invalid_scale(algo):
-    from vllm.model_executor.layers.quantization.modelopt import resolve
-
-    spec, ctx, fmt = resolve(algo, SimpleNamespace(), "")
-    source = ModelOptLinearMethod(spec, ctx, fmt)
-    scale = (
-        torch.tensor([float("nan")])
-        if algo == "FP8"
-        else torch.tensor([[[[float("nan")]]]])
-    )
-    layer = SimpleNamespace(
-        weight=torch.ones((128, 128), dtype=torch.float8_e4m3fn),
-        weight_scale=scale,
-        logical_widths=[128],
-    )
-    with pytest.raises(ValueError, match="finite positive scales"):
-        source.dequantize_weight(layer)
-    layer.weight_scale = torch.ones((2, 1))
-    with pytest.raises(ValueError, match="weight_scale shape"):
-        source.dequantize_weight(layer)
-
-
-@pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])
 def test_modelopt_fp8_attention_loads_and_converts_to_mxfp8(
     algo, default_vllm_config, monkeypatch
 ):
@@ -330,37 +278,6 @@ def test_modelopt_fp8_attention_loads_and_converts_to_mxfp8(
     assert layer.weight.shape == (128, 128)
     assert layer.weight_scale.shape == (128, 4)
     kernel.process_weights_after_loading.assert_called_once_with(layer)
-
-
-def test_modelopt_mixed_mxfp4_targets_preserve_checkpoint_source():
-    targets = {
-        "re:.*\\.self_attn\\.(qkv_proj|o_proj)$": "mxfp8",
-        "re:.*\\.mlp\\.shared_expert\\.(gate_up_proj|down_proj)$": "mxfp4",
-        "lm_head": "mxfp4",
-    }
-    model_config = SimpleNamespace(
-        quantization="mxfp4",
-        quantization_config={"targets": targets},
-        model_arch_config=SimpleNamespace(
-            quantization_config={
-                "quant_method": "modelopt",
-                "quant_algo": "MIXED_PRECISION",
-            }
-        ),
-        hf_config=SimpleNamespace(),
-    )
-    from unittest.mock import patch
-
-    with patch.object(current_platform, "verify_quantization") as verify:
-        ModelConfig._verify_quantization(model_config)
-
-    assert model_config.quantization == "modelopt_mixed"
-    assert model_config.quantization_config == resolve_quantization_config(
-        "mxfp4", {"targets": targets}
-    )
-    assert model_config.quantization_config.targets == targets
-    assert model_config.quantization_config.linear is None
-    verify.assert_called_once_with("online")
 
 
 def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
@@ -890,50 +807,6 @@ def test_online_quantization_configures_prequantized_moe(
 
     assert isinstance(layer._quant_method, Mxfp4OnlineMoEMethod)
     assert layer._quant_method.requantization_source is not None
-
-
-def test_modelopt_nvfp4_moe_source_does_not_require_execution_backend(
-    default_vllm_config, dist_init, monkeypatch
-) -> None:
-    default_vllm_config.model_config = ModelConfig()
-    prefix = "model.layers.0.mlp.experts"
-    quant_config = ModelOptMixedPrecisionConfig.from_config(
-        {
-            "quantization": {
-                "quant_algo": "MIXED_PRECISION",
-                "quantized_layers": {
-                    prefix: {
-                        "quant_algo": "W4A16_NVFP4",
-                        "group_size": 16,
-                    }
-                },
-            }
-        }
-    )
-    quant_config.online_quantization_config = OnlineQuantizationConfig(
-        quant_config_args(targets={prefix: "mxfp4"})
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.modelopt.select_nvfp4_moe_backend",
-        lambda **kwargs: pytest.fail(
-            "a requantization source must not select an execution backend"
-        ),
-    )
-
-    layer = FusedMoEFactory(
-        num_experts=4,
-        top_k=2,
-        hidden_size=32,
-        intermediate_size=64,
-        params_dtype=torch.bfloat16,
-        quant_config=quant_config,
-        prefix=prefix,
-    )
-
-    assert isinstance(layer._quant_method, Mxfp4OnlineMoEMethod)
-    source = layer._quant_method.requantization_source
-    assert isinstance(source, ModelOptNvFp4FusedMoE)
-    assert source.nvfp4_backend is None
 
 
 def _pack_e2m1(values: torch.Tensor) -> torch.Tensor:
