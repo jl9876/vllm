@@ -72,6 +72,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 logger = init_logger(__name__)
 
@@ -287,7 +288,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 return None
             source, quant_key_str, target_pattern, quant_spec, table = resolved_pattern
         else:
-            if issubclass(layer_cls, LinearBase):
+            if issubclass(layer_cls, (LinearBase, ParallelLMHead)):
                 source = OnlineQuantizationSource.linear
                 quant_spec = self.args.linear
                 table = _ONLINE_LINEAR_METHODS
@@ -359,7 +360,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
         target_pattern = matches[0]
         quant_key_str = self.args.targets[target_pattern]
         shorthand = _ONLINE_SHORTHANDS[quant_key_str]
-        if issubclass(layer_cls, LinearBase):
+        if issubclass(layer_cls, (LinearBase, ParallelLMHead)):
             quant_spec = shorthand.linear
             table = _ONLINE_LINEAR_METHODS
         elif issubclass(layer_cls, RoutedExperts):
@@ -404,7 +405,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
             assert issubclass(quant_method_cls, OnlineLinearBase)
             return quant_method_cls()
 
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, (LinearBase, ParallelLMHead)):
             return UnquantizedLinearMethod()
         if isinstance(layer, RoutedExperts):
             return UnquantizedFusedMoEMethod(layer.moe_config)

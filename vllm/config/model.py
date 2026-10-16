@@ -1454,7 +1454,7 @@ class ModelConfig:
         if (
             quant_cfg is not None
             and requested_quantization == "mxfp4"
-            and self.quantization == "modelopt_fp4"
+            and self.quantization in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.quantization_config = resolve_quantization_config(
                 requested_quantization, self.quantization_config or {}
@@ -1471,13 +1471,19 @@ class ModelConfig:
             )
             execution_quantization = self.quantization
             if (
-                self.quantization == "modelopt_fp4"
+                self.quantization in ("modelopt_fp4", "modelopt_mixed")
                 and online_args is not None
-                and online_args.linear is not None
-                and online_args.linear.weight is not None
-                and online_args.moe is not None
-                and online_args.moe.weight is not None
-                and not online_args.ignore
+                and (
+                    bool(online_args.targets)
+                    or (
+                        online_args.linear is not None
+                        and online_args.linear.weight is not None
+                    )
+                    or (
+                        online_args.moe is not None
+                        and online_args.moe.weight is not None
+                    )
+                )
             ):
                 execution_quantization = "online"
             current_platform.verify_quantization(execution_quantization)

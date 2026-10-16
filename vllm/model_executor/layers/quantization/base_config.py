@@ -308,15 +308,14 @@ def resolve_quant_method(
     from vllm.model_executor.layers.quantization.online.moe_base import (
         OnlineMoEMethodBase,
     )
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     base_quant_method = quant_config.get_quant_method(layer, prefix)
     if quant_config.online_quantization_config is None:
         # No online configuration: retain the checkpoint method.
         return base_quant_method
-    # Online quantization currently supports only LinearBase and RoutedExperts.
-    # Embeddings and ParallelLMHead retain their checkpoint quantization method.
-    if not isinstance(layer, (LinearBase, RoutedExperts)):
-        # Online quantization only supports linear and routed MoE layers.
+    # Ordinary embeddings must retain their embedding quantization method.
+    if not isinstance(layer, (LinearBase, ParallelLMHead, RoutedExperts)):
         return base_quant_method
 
     quant_config.online_quantization_config.packed_modules_mapping = (

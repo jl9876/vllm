@@ -132,6 +132,14 @@ class OnlineLinearBase(OnlineRequantizationMixin, LinearMethodBase):
         self.out_dtype = torch.get_default_dtype()
         self.input_dtype = get_current_vllm_config().model_config.dtype
 
+    def tie_weights(
+        self, layer: torch.nn.Module, embed_tokens: torch.nn.Module
+    ) -> torch.nn.Module:
+        del layer, embed_tokens
+        raise ValueError(
+            "Online-quantized lm_head cannot share weights with input embeddings."
+        )
+
     def get_weight_for_quantization(self, layer: torch.nn.Module) -> torch.Tensor:
         if self.requantization_source is None:
             return layer.weight

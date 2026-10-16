@@ -275,6 +275,9 @@ def resolve_quantization_config(
     if base is None:
         return quantization_config
 
+    if quantization_config.targets is not None:
+        return quantization_config
+
     return QuantizationConfigArgs(
         linear=quantization_config.linear or base.linear,
         moe=quantization_config.moe or base.moe,

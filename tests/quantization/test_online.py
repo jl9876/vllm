@@ -65,6 +65,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptLinearMethod,
+    ModelOptMixedPrecisionConfig,
     ModelOptMxFp8Config,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
@@ -123,6 +124,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     weight_amax,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader import weight_utils
@@ -207,6 +210,279 @@ def test_modelopt_nvfp4_mxfp4_shorthand_preserves_checkpoint_source(requested):
             "mxfp4", {}
         )
         verify.assert_called_once_with("online")
+
+
+@pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])
+def test_modelopt_fp8_source_dequantizes_for_mxfp8(algo):
+    from vllm.model_executor.layers.quantization.modelopt import resolve
+
+    spec, ctx, fmt = resolve(algo, SimpleNamespace(), "")
+    source = ModelOptLinearMethod(spec, ctx, fmt)
+    source.out_dtype = torch.bfloat16
+    weight = torch.ones((130, 256), dtype=torch.float8_e4m3fn)
+    if algo == "FP8":
+        scale = torch.tensor([2.0, 3.0])
+        widths = [64, 66]
+        expected = torch.cat((torch.full((64, 256), 2.0), torch.full((66, 256), 3.0)))
+    else:
+        scale = torch.tensor([[2.0, 3.0], [4.0, 5.0]], dtype=torch.float32).view(
+            2, 1, 2, 1
+        )
+        widths = [130]
+        expected = torch.tensor(
+            [[2.0] * 128 + [3.0] * 128] * 128 + [[4.0] * 128 + [5.0] * 128] * 2
+        )
+    layer = SimpleNamespace(weight=weight, weight_scale=scale, logical_widths=widths)
+    actual = source.dequantize_weight(layer)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
+    if algo == "FP8_PB_WO":
+        layer.weight_scale = scale[:, 0, :, 0]
+        torch.testing.assert_close(source.dequantize_weight(layer), actual)
+
+
+@pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])
+def test_modelopt_fp8_requantization_rejects_missing_or_invalid_scale(algo):
+    from vllm.model_executor.layers.quantization.modelopt import resolve
+
+    spec, ctx, fmt = resolve(algo, SimpleNamespace(), "")
+    source = ModelOptLinearMethod(spec, ctx, fmt)
+    scale = (
+        torch.tensor([float("nan")])
+        if algo == "FP8"
+        else torch.tensor([[[[float("nan")]]]])
+    )
+    layer = SimpleNamespace(
+        weight=torch.ones((128, 128), dtype=torch.float8_e4m3fn),
+        weight_scale=scale,
+        logical_widths=[128],
+    )
+    with pytest.raises(ValueError, match="finite positive scales"):
+        source.dequantize_weight(layer)
+    layer.weight_scale = torch.ones((2, 1))
+    with pytest.raises(ValueError, match="weight_scale shape"):
+        source.dequantize_weight(layer)
+
+
+@pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])
+def test_modelopt_fp8_attention_loads_and_converts_to_mxfp8(
+    algo, default_vllm_config, monkeypatch
+):
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    for module in (
+        "vllm.model_executor.layers.linear",
+        "vllm.model_executor.parameter",
+    ):
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
+    kernel = Mock()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.mxfp8.init_mxfp8_linear_kernel",
+        lambda **kwargs: kernel,
+    )
+    config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.o_proj": {"quant_algo": algo}
+                },
+            }
+        }
+    )
+    config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(targets={"model.layers.0.self_attn.o_proj": "mxfp8"})
+    )
+    layer = ColumnParallelLinear(
+        input_size=128,
+        output_size=128,
+        bias=False,
+        quant_config=config,
+        prefix="model.layers.0.self_attn.o_proj",
+    )
+    assert isinstance(layer.quant_method, Mxfp8OnlineLinearMethod)
+    assert isinstance(layer.quant_method.requantization_source, ModelOptLinearMethod)
+    scale = torch.tensor([2.0]) if algo == "FP8" else torch.tensor([[[[2.0]]]])
+    for name, value in (
+        ("weight", torch.ones((128, 128), dtype=torch.float8_e4m3fn)),
+        ("weight_scale", scale),
+    ):
+        parameter = getattr(layer, name)
+        parameter.weight_loader(parameter, value)
+    captured = []
+
+    def quantize(weight):
+        captured.append(weight.clone())
+        return (
+            torch.zeros((128, 128), dtype=MXFP8_VALUE_DTYPE),
+            torch.zeros((128, 4), dtype=MXFP8_SCALE_DTYPE),
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.mxfp8.mxfp8_e4m3_quantize",
+        quantize,
+    )
+    layer.quant_method.process_weights_after_loading(layer)
+    torch.testing.assert_close(
+        captured[0], torch.full((128, 128), 2.0, dtype=torch.bfloat16)
+    )
+    assert "input_scale" not in layer._parameters
+    assert layer.weight.shape == (128, 128)
+    assert layer.weight_scale.shape == (128, 4)
+    kernel.process_weights_after_loading.assert_called_once_with(layer)
+
+
+def test_modelopt_mixed_mxfp4_targets_preserve_checkpoint_source():
+    targets = {
+        "re:.*\\.self_attn\\.(qkv_proj|o_proj)$": "mxfp8",
+        "re:.*\\.mlp\\.shared_expert\\.(gate_up_proj|down_proj)$": "mxfp4",
+        "lm_head": "mxfp4",
+    }
+    model_config = SimpleNamespace(
+        quantization="mxfp4",
+        quantization_config={"targets": targets},
+        model_arch_config=SimpleNamespace(
+            quantization_config={
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+            }
+        ),
+        hf_config=SimpleNamespace(),
+    )
+    from unittest.mock import patch
+
+    with patch.object(current_platform, "verify_quantization") as verify:
+        ModelConfig._verify_quantization(model_config)
+
+    assert model_config.quantization == "modelopt_mixed"
+    assert model_config.quantization_config == resolve_quantization_config(
+        "mxfp4", {"targets": targets}
+    )
+    assert model_config.quantization_config.targets == targets
+    assert model_config.quantization_config.linear is None
+    verify.assert_called_once_with("online")
+
+
+def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
+    default_vllm_config, monkeypatch
+):
+    from vllm.model_executor.layers.quantization.online.requantization import (
+        _ModelOptNvfp4LinearSource,
+    )
+
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    for module in (
+        "vllm.model_executor.layers.linear",
+        "vllm.model_executor.parameter",
+    ):
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
+    kernel = Mock()
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.mxfp4.init_mxfp4_linear_kernel",
+        lambda **kwargs: kernel,
+    )
+    config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.mlp.shared_expert.gate_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.layers.0.mlp.shared_expert.up_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.layers.0.mlp.shared_expert.down_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                    "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+                },
+            }
+        }
+    )
+    config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(
+            targets={
+                "re:.*\\.shared_expert\\.(gate_up_proj|down_proj)$": "mxfp4",
+                "lm_head": "mxfp4",
+            }
+        )
+    )
+    gate = ColumnParallelLinear(
+        input_size=32,
+        output_size=32,
+        bias=False,
+        quant_config=config,
+        prefix="model.layers.0.mlp.shared_expert.gate_up_proj",
+    )
+    assert isinstance(gate.quant_method, Mxfp4OnlineLinearMethod)
+    assert isinstance(
+        gate.quant_method.requantization_source, _ModelOptNvfp4LinearSource
+    )
+    down = RowParallelLinear(
+        input_size=32,
+        output_size=32,
+        bias=False,
+        quant_config=config,
+        prefix="model.layers.0.mlp.shared_expert.down_proj",
+    )
+    assert isinstance(down.quant_method, Mxfp4OnlineLinearMethod)
+    assert isinstance(
+        down.quant_method.requantization_source, _ModelOptNvfp4LinearSource
+    )
+    head = ParallelLMHead(
+        130, 32, padding_size=64, disable_tp=True, quant_config=config, prefix="lm_head"
+    )
+    assert isinstance(head.quant_method, Mxfp4OnlineLinearMethod)
+    assert isinstance(
+        head.quant_method.requantization_source, _ModelOptNvfp4LinearSource
+    )
+    embedding = VocabParallelEmbedding(
+        130,
+        32,
+        padding_size=64,
+        disable_tp=True,
+        quant_config=config,
+        prefix="model.embed_tokens",
+    )
+    assert isinstance(embedding.quant_method, UnquantizedEmbeddingMethod)
+    with pytest.raises(ValueError, match="cannot share weights"):
+        head.tie_weights(embedding)
+    assert head.num_embeddings_per_partition == 192
+    for name, value in (
+        ("weight", torch.full((130, 16), 0x22, dtype=torch.uint8)),
+        ("weight_scale", torch.ones((130, 2), dtype=torch.float8_e4m3fn)),
+        ("weight_scale_2", torch.tensor(2.0)),
+    ):
+        parameter = getattr(head, name)
+        parameter.weight_loader(parameter, value)
+    assert torch.count_nonzero(head.weight[130:]) == 0
+    assert torch.count_nonzero(head.weight_scale[130:]) == 0
+    captured = []
+
+    def quantize(weight):
+        captured.append(weight)
+        return (
+            torch.zeros((192, 16), dtype=torch.uint8),
+            torch.zeros((192, 1), dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.mxfp4.mxfp4_quantize",
+        quantize,
+    )
+    head.quant_method.process_weights_after_loading(head)
+    assert captured[0].shape == (192, 32)
+    assert torch.count_nonzero(captured[0][130:]) == 0
+    assert "weight_scale_2" not in head._parameters
+    assert "input_scale" not in head._parameters
+    assert head.weight.shape == (192, 16)
+    assert head.weight_scale.shape == (192, 1)
 
 
 GRANITE_MODEL_NAME = "ibm-granite/granite-3.0-1b-a400m-base"

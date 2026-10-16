@@ -98,6 +98,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4DynamicToken,
     kNvfp4Static,
+    require_finite_positive_scales,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
@@ -2672,10 +2673,60 @@ class ModelOptLinearMethod(LinearMethodBase):
             return dequant_mxfp8_to_bf16(
                 layer.weight.contiguous(), layer.weight_scale.contiguous()
             )
-        else:
-            raise NotImplementedError(
-                "ModelOpt weight dequantization is only supported for MXFP8."
+        if self.wkey.key in (kFp8StaticTensorSym, kFp8Static128BlockSym):
+            weight = layer.weight
+            scale = layer.weight_scale
+            if self.wkey.key is kFp8StaticTensorSym:
+                if scale.shape != (len(layer.logical_widths),):
+                    raise ValueError(
+                        f"Unexpected ModelOpt FP8 weight_scale shape "
+                        f"{tuple(scale.shape)}"
+                    )
+                require_finite_positive_scales("ModelOpt FP8 weight_scale", scale)
+                result = torch.empty(
+                    weight.shape, dtype=self.out_dtype, device=weight.device
+                )
+                start = 0
+                for width, partition_scale in zip(
+                    layer.logical_widths, scale, strict=True
+                ):
+                    end = start + width
+                    result[start:end] = (
+                        weight[start:end].to(self.out_dtype) * partition_scale
+                    )
+                    start = end
+                if start != weight.shape[0]:
+                    raise ValueError("ModelOpt FP8 partitions do not match weight rows")
+                return result
+
+            if scale.ndim == 4:
+                if scale.shape[1] != 1 or scale.shape[3] != 1:
+                    raise ValueError(
+                        f"Unexpected ModelOpt FP8_PB_WO weight_scale shape "
+                        f"{tuple(scale.shape)}"
+                    )
+                scale = scale[:, 0, :, 0]
+            expected_shape = (
+                (weight.shape[0] + 127) // 128,
+                weight.shape[1] // 128,
             )
+            if weight.shape[1] % 128 or scale.shape != expected_shape:
+                raise ValueError(
+                    f"ModelOpt FP8_PB_WO weight_scale shape {tuple(scale.shape)} "
+                    f"does not match weight shape {tuple(weight.shape)}"
+                )
+            require_finite_positive_scales("ModelOpt FP8_PB_WO weight_scale", scale)
+            result = torch.empty(
+                weight.shape, dtype=self.out_dtype, device=weight.device
+            )
+            for start in range(0, weight.shape[0], 128):
+                rows = slice(start, min(start + 128, weight.shape[0]))
+                block_scale = scale[start // 128].repeat_interleave(128)
+                result[rows] = weight[rows].to(self.out_dtype) * block_scale
+            return result
+        raise NotImplementedError(
+            f"ModelOpt weight dequantization is not supported for {self.wkey.key}."
+        )
 
     def apply(self, layer, x, bias=None):
         return self.fmt.apply(
