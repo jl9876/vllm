@@ -112,9 +112,9 @@ Currently supported combinations are:
 | Checkpoint layer | Online target | Requirements |
 | ---------------- | ------------- | ------------ |
 | Serialized ModelOpt MXFP8 linear | any online linear method | Target-specific hardware requirements |
-| Serialized ModelOpt FP8 or FP8_PB_WO linear | any online linear method | FP8_PB_WO requires 128-aligned input width |
-| Serialized ModelOpt NVFP4 linear | any online linear method | Target-specific hardware requirements |
-| Serialized ModelOpt NVFP4 lm_head | any online linear method | Requires an untied output embedding |
+| Serialized ModelOpt FP8 or FP8_PB_WO linear | any supported online linear method | FP8_PB_WO requires 128-aligned input width |
+| Serialized ModelOpt NVFP4 linear | any supported online linear method | Target-specific hardware requirements |
+| Serialized ModelOpt NVFP4 lm_head | any supported online linear method | Requires an untied output embedding |
 | Serialized compressed-tensors NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
 | Serialized ModelOpt NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
 | Serialized Quark NVFP4 MoE | any online MoE method | Target-specific hardware requirements |
@@ -145,39 +145,15 @@ vllm serve nvidia/Qwen3-30B-A3B-NVFP4 \
     --quantization mxfp4
 ```
 
-For mixed-precision ModelOpt checkpoints, use `targets` to choose the
-destination per layer. For example, the Qwen3.6-35B-A3B-NVFP4 checkpoint
-stores attention projections as per-tensor FP8 and standalone shared experts
-and `lm_head` as W4A16 NVFP4. The same FP8-to-MXFP8 conversion also accepts
-ModelOpt blockwise `FP8_PB_WO` projections:
-
-```bash
-vllm serve /path/to/Qwen3.6-35B-A3B-NVFP4 --quantization mxfp4 \
-  --quantization-config '{
-    "targets": {
-      "re:.*\\.linear_attn\\.(in_proj_qkvz|out_proj)$": "mxfp8",
-      "re:.*\\.self_attn\\.(qkv_proj|o_proj)$": "mxfp8",
-      "re:.*\\.mlp\\.shared_expert\\.(gate_up_proj|down_proj)$": "mxfp4",
-      "re:.*\\.mlp\\.experts$": "mxfp4",
-      "lm_head": "mxfp4"
-    }
-  }'
-```
-
-Unmatched layers retain their checkpoint quantization. Fused shared experts
-are not supported by this conversion; use the standalone shared-expert path.
-Check the checkpoint's `quantized_layers` and the model's packed-module
-mapping when adapting these patterns to another checkpoint. Platforms that do
-not support the checkpoint backend must target every checkpoint-quantized
-layer; partial or non-matching targets still require that backend.
+For mixed-precision ModelOpt checkpoints, use `targets` to select conversions
+per layer. Unmatched layers retain the checkpoint backend. Fused shared experts
+and tied `lm_head` weights are not supported.
 
 The target backend determines activation precision; XPU may use BF16
 activations. Without `targets`, unquantized linear layers, including router
 gates, are also quantized unless excluded through `quantization_config.ignore`.
-Conversion can introduce additional quantization error and does not export a
-checkpoint. Re-quantization temporarily materializes each source weight in the
-model dtype before producing the target weight, so model loading needs more
-peak memory than loading either serialized format directly.
+Conversion can introduce additional quantization error, increase peak loading
+memory, and does not export a checkpoint.
 
 !!! info
 

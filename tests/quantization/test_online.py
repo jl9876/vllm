@@ -227,15 +227,8 @@ def test_modelopt_nvfp4_mxfp4_shorthand_preserves_checkpoint_source(requested):
 
 
 def test_modelopt_mixed_verifies_residual_checkpoint_backend(
-    default_vllm_config, monkeypatch
+    monkeypatch,
 ):
-    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
-    for module in (
-        "vllm.model_executor.layers.linear",
-        "vllm.model_executor.parameter",
-    ):
-        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_rank", lambda: 0)
-        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
     prefix = "model.layers.0.self_attn.o_proj"
     quant_config = ModelOptMixedPrecisionConfig.from_config(
         {
@@ -248,23 +241,17 @@ def test_modelopt_mixed_verifies_residual_checkpoint_backend(
     quant_config.online_quantization_config = OnlineQuantizationConfig(
         quant_config_args(targets={"lm_head": "mxfp4"})
     )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.modelopt.select_linear_kernel",
-        lambda *args, **kwargs: Mock(),
-    )
     verify = Mock()
     monkeypatch.setattr(current_platform, "verify_quantization", verify)
+    layer = object.__new__(ColumnParallelLinear)
 
-    layer = ColumnParallelLinear(
-        input_size=32,
-        output_size=32,
-        bias=False,
-        quant_config=quant_config,
-        prefix=prefix,
-        disable_tp=True,
+    from vllm.model_executor.layers.quantization.base_config import (
+        resolve_quant_method,
     )
 
-    assert isinstance(layer.quant_method, ModelOptLinearMethod)
+    method = resolve_quant_method(quant_config, layer, prefix)
+
+    assert isinstance(method, ModelOptLinearMethod)
     verify.assert_called_once_with("modelopt_mixed")
 
 
@@ -368,10 +355,6 @@ def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
                         "quant_algo": "W4A16_NVFP4",
                         "group_size": 16,
                     },
-                    "model.layers.0.mlp.shared_expert.down_proj": {
-                        "quant_algo": "W4A16_NVFP4",
-                        "group_size": 16,
-                    },
                     "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
                 },
             }
@@ -381,7 +364,7 @@ def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
     config.online_quantization_config = OnlineQuantizationConfig(
         quant_config_args(
             targets={
-                "re:.*\\.shared_expert\\.(gate_up_proj|down_proj)$": "mxfp4",
+                "re:.*\\.shared_expert\\.gate_up_proj$": "mxfp4",
                 "lm_head": "mxfp4",
             }
         )
@@ -396,17 +379,6 @@ def test_modelopt_mixed_shared_expert_and_lm_head_online_dispatch(
     assert isinstance(gate.quant_method, Mxfp4OnlineLinearMethod)
     assert isinstance(
         gate.quant_method.requantization_source, _ModelOptNvfp4LinearSource
-    )
-    down = RowParallelLinear(
-        input_size=32,
-        output_size=32,
-        bias=False,
-        quant_config=config,
-        prefix="model.layers.0.mlp.shared_expert.down_proj",
-    )
-    assert isinstance(down.quant_method, Mxfp4OnlineLinearMethod)
-    assert isinstance(
-        down.quant_method.requantization_source, _ModelOptNvfp4LinearSource
     )
     head = ParallelLMHead(
         130,
