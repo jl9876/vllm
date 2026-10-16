@@ -10,6 +10,8 @@ import torch
 from torch import nn
 from transformers import PreTrainedConfig
 
+from vllm.logger import init_logger
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationMethods
     from vllm.model_executor.layers.quantization.online.base import (
@@ -18,6 +20,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 else:
     QuantizationMethods = str
+
+logger = init_logger(__name__)
 
 
 class QuantizeMethodBase(ABC):
@@ -126,6 +130,7 @@ class QuantizationConfig(ABC):
         super().__init__()
         # mapping is updated by models as they initialize
         self.packed_modules_mapping: dict[str, list[str]] = dict()
+        self._residual_backend_verified = False
 
     @abstractmethod
     def get_name(self) -> QuantizationMethods:
@@ -222,6 +227,12 @@ class QuantizationConfig(ABC):
         """Return a checkpoint method used only as an online weight source."""
         return self.get_quant_method(layer, prefix)
 
+    def is_checkpoint_layer_quantized(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> bool:
+        """Return whether an unmatched online layer uses the checkpoint backend."""
+        return False
+
     @staticmethod
     def get_cache_scale_mapper() -> "WeightsMapper":
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
@@ -315,12 +326,27 @@ def resolve_quant_method(
         OnlineMoEMethodBase,
     )
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from vllm.platforms import current_platform
+
+    def verify_residual_checkpoint_backend() -> None:
+        if quant_config._residual_backend_verified:
+            return
+        logger.warning(
+            "Online quantization does not replace checkpoint-quantized layer %s; "
+            "verifying the residual %s backend.",
+            prefix,
+            quant_config.get_name(),
+        )
+        current_platform.verify_quantization(quant_config.get_name())
+        quant_config._residual_backend_verified = True
 
     if quant_config.online_quantization_config is None:
         # No online configuration: retain the checkpoint method.
         return quant_config.get_quant_method(layer, prefix)
     # Ordinary embeddings must retain their embedding quantization method.
     if not isinstance(layer, (LinearBase, ParallelLMHead, RoutedExperts)):
+        if quant_config.is_checkpoint_layer_quantized(layer, prefix):
+            verify_residual_checkpoint_backend()
         return quant_config.get_quant_method(layer, prefix)
 
     quant_config.online_quantization_config.packed_modules_mapping = (
@@ -330,15 +356,13 @@ def resolve_quant_method(
         type(layer), prefix
     )
     if online_target is None:
+        if quant_config.is_checkpoint_layer_quantized(layer, prefix):
+            verify_residual_checkpoint_backend()
         base_quant_method = quant_config.get_quant_method(layer, prefix)
     else:
-        requantization_getter = getattr(
-            type(quant_config), "get_quant_method_for_requantization", None
+        base_quant_method = quant_config.get_quant_method_for_requantization(
+            layer, prefix
         )
-        if requantization_getter is None:
-            base_quant_method = quant_config.get_quant_method(layer, prefix)
-        else:
-            base_quant_method = requantization_getter(quant_config, layer, prefix)
     checkpoint_is_quantized = base_quant_method is not None and not isinstance(
         base_quant_method, (UnquantizedLinearMethod, UnquantizedFusedMoEMethod)
     )

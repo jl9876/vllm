@@ -185,6 +185,20 @@ def test_online_nvfp4_linear_requantization_preserves_partition_scales():
     expected = torch.tensor([2.0] * 4 + [3.0] * 2 + [5.0] * 2)
     torch.testing.assert_close(actual.float(), expected[:, None].expand(8, 32))
 
+    layer.weight_scale_2.data[0] = 0
+    with pytest.raises(ValueError, match="finite positive scales"):
+        method.requantization_source.dequantize_weight(layer)
+    layer.weight_scale_2.data[0] = 2
+
+    layer.weight_scale.data[0, 0] = float("nan")
+    with pytest.raises(ValueError, match="must contain finite scales"):
+        method.requantization_source.dequantize_weight(layer)
+    layer.weight_scale.data[0, 0] = 1
+
+    layer.logical_widths = [4, 2]
+    with pytest.raises(ValueError, match="partitions do not match weight rows"):
+        method.requantization_source.dequantize_weight(layer)
+
 
 @pytest.mark.parametrize("requested", [None, "mxfp4"])
 def test_modelopt_nvfp4_mxfp4_shorthand_preserves_checkpoint_source(requested):
@@ -210,6 +224,48 @@ def test_modelopt_nvfp4_mxfp4_shorthand_preserves_checkpoint_source(requested):
             "mxfp4", {}
         )
         verify.assert_called_once_with("online")
+
+
+def test_modelopt_mixed_verifies_residual_checkpoint_backend(
+    default_vllm_config, monkeypatch
+):
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    for module in (
+        "vllm.model_executor.layers.linear",
+        "vllm.model_executor.parameter",
+    ):
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
+    prefix = "model.layers.0.self_attn.o_proj"
+    quant_config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {prefix: {"quant_algo": "FP8"}},
+            }
+        }
+    )
+    quant_config.online_quantization_config = OnlineQuantizationConfig(
+        quant_config_args(targets={"lm_head": "mxfp4"})
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.modelopt.select_linear_kernel",
+        lambda *args, **kwargs: Mock(),
+    )
+    verify = Mock()
+    monkeypatch.setattr(current_platform, "verify_quantization", verify)
+
+    layer = ColumnParallelLinear(
+        input_size=32,
+        output_size=32,
+        bias=False,
+        quant_config=quant_config,
+        prefix=prefix,
+        disable_tp=True,
+    )
+
+    assert isinstance(layer.quant_method, ModelOptLinearMethod)
+    verify.assert_called_once_with("modelopt_mixed")
 
 
 @pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])
@@ -1089,6 +1145,8 @@ def test_weight_loading_requantization_moe(
     quant_config.packed_modules_mapping = {}
     quant_config.get_name.return_value = source_format
     quant_config.get_quant_method.return_value = source
+    quant_config.get_quant_method_for_requantization.return_value = source
+    quant_config.is_checkpoint_layer_quantized.return_value = False
     quant_config.online_quantization_config = OnlineQuantizationConfig(
         quant_config_args(moe="fp8_per_tensor")
     )

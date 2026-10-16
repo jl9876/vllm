@@ -225,6 +225,18 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         return False
 
+    def is_checkpoint_layer_quantized(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> bool:
+        if isinstance(layer, (Attention, MLAAttention)):
+            return bool(
+                getattr(self, "kv_cache_quant_method", None)
+                or getattr(self, "kv_cache_quant_algo", None)
+            )
+        return not self.is_layer_excluded(prefix) and isinstance(
+            layer, (LinearBase, ParallelLMHead, RoutedExperts)
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -1634,6 +1646,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             for info in self.quantized_layers.values()
         )
 
+    def is_checkpoint_layer_quantized(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> bool:
+        if isinstance(layer, (Attention, MLAAttention)):
+            return bool(self.kv_cache_quant_method)
+        return (
+            not self.is_layer_excluded(prefix)
+            and isinstance(layer, (LinearBase, ParallelLMHead, RoutedExperts))
+            and self._resolve_quant_algo(prefix) is not None
+        )
+
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
 
@@ -2693,14 +2716,14 @@ class ModelOptLinearMethod(LinearMethodBase):
 
     def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
         """Reconstruct serialized weights for online requantization."""
-        if self.wkey.key is kMxfp8Static:
+        if self.wkey.key == kMxfp8Static:
             return dequant_mxfp8_to_bf16(
                 layer.weight.contiguous(), layer.weight_scale.contiguous()
             )
         if self.wkey.key in (kFp8StaticTensorSym, kFp8Static128BlockSym):
             weight = layer.weight
             scale = layer.weight_scale
-            if self.wkey.key is kFp8StaticTensorSym:
+            if self.wkey.key == kFp8StaticTensorSym:
                 if scale.shape != (len(layer.logical_widths),):
                     raise ValueError(
                         f"Unexpected ModelOpt FP8 weight_scale shape "

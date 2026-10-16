@@ -167,13 +167,17 @@ vllm serve /path/to/Qwen3.6-35B-A3B-NVFP4 --quantization mxfp4 \
 Unmatched layers retain their checkpoint quantization. Fused shared experts
 are not supported by this conversion; use the standalone shared-expert path.
 Check the checkpoint's `quantized_layers` and the model's packed-module
-mapping when adapting these patterns to another checkpoint.
+mapping when adapting these patterns to another checkpoint. Platforms that do
+not support the checkpoint backend must target every checkpoint-quantized
+layer; partial or non-matching targets still require that backend.
 
 The target backend determines activation precision; XPU may use BF16
 activations. Without `targets`, unquantized linear layers, including router
 gates, are also quantized unless excluded through `quantization_config.ignore`.
 Conversion can introduce additional quantization error and does not export a
-checkpoint.
+checkpoint. Re-quantization temporarily materializes each source weight in the
+model dtype before producing the target weight, so model loading needs more
+peak memory than loading either serialized format directly.
 
 !!! info
 

@@ -5,6 +5,9 @@ import torch
 
 from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    require_finite_positive_scales,
+)
 
 
 @register_weight_loader_v2_supported_method
@@ -43,7 +46,57 @@ class _ModelOptNvfp4LinearSource(QuantizeMethodBase):
             nvfp4_emulation_utils,
         )
 
+        if (
+            not layer.logical_widths
+            or any(width <= 0 for width in layer.logical_widths)
+            or sum(layer.logical_widths) != layer.weight.shape[0]
+        ):
+            raise ValueError(
+                "ModelOpt NVFP4 partitions do not match weight rows: "
+                f"logical_widths={layer.logical_widths}, "
+                f"weight_shape={tuple(layer.weight.shape)}"
+            )
+        if layer.weight_scale_2.numel() != len(layer.logical_widths):
+            raise ValueError(
+                "ModelOpt NVFP4 global scale count does not match partitions: "
+                f"scale_shape={tuple(layer.weight_scale_2.shape)}, "
+                f"partitions={len(layer.logical_widths)}"
+            )
+
         input_size = layer.weight.shape[1] * 2
+        group_size = self.source_method.ctx.group_size
+        if (
+            group_size is None
+            or input_size % group_size
+            or layer.weight_scale.shape
+            != (layer.weight.shape[0], input_size // group_size)
+        ):
+            raise ValueError(
+                "ModelOpt NVFP4 block scale shape does not match weight shape: "
+                f"scale_shape={tuple(layer.weight_scale.shape)}, "
+                f"weight_shape={tuple(layer.weight.shape)}, "
+                f"group_size={group_size}"
+            )
+        weight_scale = layer.weight_scale.float()
+        if not torch.isfinite(weight_scale).all():
+            raise ValueError("ModelOpt NVFP4 weight_scale must contain finite scales")
+        active_rows = getattr(
+            layer, "num_org_embeddings_per_partition", layer.weight.shape[0]
+        )
+        if not 0 < active_rows <= layer.weight.shape[0]:
+            raise ValueError(
+                "ModelOpt NVFP4 active rows do not match weight rows: "
+                f"active_rows={active_rows}, weight_shape={tuple(layer.weight.shape)}"
+            )
+        require_finite_positive_scales(
+            "ModelOpt NVFP4 weight_scale", weight_scale[:active_rows]
+        )
+        if (weight_scale[active_rows:] < 0).any():
+            raise ValueError("ModelOpt NVFP4 padding weight_scale must be non-negative")
+        require_finite_positive_scales(
+            "ModelOpt NVFP4 weight_scale_2", layer.weight_scale_2
+        )
+
         weight = torch.empty(
             (layer.weight.shape[0], input_size),
             dtype=self.source_method.out_dtype,
@@ -59,7 +112,7 @@ class _ModelOptNvfp4LinearSource(QuantizeMethodBase):
                     layer.weight_scale[rows].contiguous(),
                     layer.weight_scale_2[partition],
                     weight.dtype,
-                    block_size=self.source_method.ctx.group_size,
+                    block_size=group_size,
                     swizzle=False,
                 )
             offset += width
