@@ -390,5 +390,8 @@ def resolve_quant_method(
         # The layer is unquantized and no online target applies.
         return base_quant_method
 
+    if quant_config.online_quantization_config.args.requantize_only:
+        return base_quant_method
+
     # Quantize an unquantized layer with the online method.
     return quant_config.online_quantization_config.get_quant_method(layer, prefix)

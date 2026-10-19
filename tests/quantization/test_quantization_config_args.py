@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kInt4Static32,
     kInt8StaticChannelSym,
+    kMxfp4Static,
     kMxfp8Dynamic,
     kNvfp4DynamicToken,
     kNvfp4Static,
@@ -111,6 +112,14 @@ def test_resolve_shorthand_only_populates_both_slots():
     assert args is not None
     assert args.linear == QuantSpec(weight=kFp8Static128BlockSym)
     assert args.moe == QuantSpec(weight=kFp8Static128BlockSym)
+
+
+def test_resolve_inc_mxfp4_alias():
+    args = resolve_quantization_config("inc_mxfp4", None)
+    assert args is not None
+    assert args.linear == QuantSpec(weight=kMxfp4Static)
+    assert args.moe == QuantSpec(weight=kMxfp4Static)
+    assert args.requantize_only
 
 
 @pytest.mark.parametrize("quantization", ["mxfp4", "mxfp8"])

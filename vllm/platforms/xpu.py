@@ -117,6 +117,7 @@ class XPUPlatform(Platform):
         "auto_awq",
         "auto_gptq",
         "inc",
+        "inc_mxfp4",
         "fp8",
         "deepseek_v4_fp8",
         "mxfp4",

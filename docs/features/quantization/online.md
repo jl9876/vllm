@@ -145,6 +145,9 @@ vllm serve nvidia/Qwen3-30B-A3B-NVFP4 \
     --quantization mxfp4
 ```
 
+On XPU, `--quantization inc_mxfp4` enables this conversion for serialized
+ModelOpt NVFP4 checkpoints.
+
 For mixed-precision ModelOpt checkpoints, use `targets` to select conversions
 per layer. Unmatched layers retain the checkpoint backend. Fused shared experts
 and tied `lm_head` weights are not supported.

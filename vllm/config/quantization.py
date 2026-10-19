@@ -130,6 +130,9 @@ class QuantizationConfigArgs:
     Mutually exclusive with `linear` and `moe`.
     """
 
+    requantize_only: bool = False
+    """Apply online methods only to serialized checkpoint-quantized layers."""
+
     @field_validator("linear", "moe", mode="before")
     @classmethod
     def _coerce_spec(cls, v: Any, info: ValidationInfo) -> Any:
@@ -223,10 +226,19 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
     ),
 }
 
+_ONLINE_SHORTHAND_ALIASES: dict[str, QuantizationConfigArgs] = {
+    "inc_mxfp4": QuantizationConfigArgs(
+        linear=QuantSpec(weight=kMxfp4Static),
+        moe=QuantSpec(weight=kMxfp4Static),
+        requantize_only=True,
+    ),
+}
+
 
 # Names accepted by `--quantization`; "online" means "use quantization_config".
 ONLINE_QUANT_SHORTHAND_NAMES: tuple[str, ...] = (
     *_ONLINE_SHORTHANDS.keys(),
+    *_ONLINE_SHORTHAND_ALIASES.keys(),
     "online",
 )
 
@@ -262,7 +274,9 @@ def resolve_quantization_config(
             return QuantizationConfigArgs(**quantization_config)
         return quantization_config
 
-    base = _ONLINE_SHORTHANDS.get(quantization) if quantization else None
+    base = _ONLINE_SHORTHAND_ALIASES.get(quantization)
+    if base is None:
+        base = _ONLINE_SHORTHANDS.get(quantization) if quantization else None
 
     if quantization_config is None:
         if quantization in _DEFERRED_ONLINE_SHORTHANDS:
@@ -283,4 +297,5 @@ def resolve_quantization_config(
         moe=quantization_config.moe or base.moe,
         ignore=quantization_config.ignore or base.ignore,
         targets=quantization_config.targets or base.targets,
+        requantize_only=quantization_config.requantize_only or base.requantize_only,
     )

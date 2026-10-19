@@ -1451,9 +1451,33 @@ class ModelConfig:
                     f"({self.quantization})."
                 )
 
+        if requested_quantization == "inc_mxfp4":
+            if not current_platform.is_xpu():
+                raise ValueError("inc_mxfp4 quantization is only supported on XPU.")
+            current_platform.verify_quantization(requested_quantization)
+            modelopt_config = (
+                quant_cfg.get("quantization", quant_cfg)
+                if isinstance(quant_cfg, dict)
+                else {}
+            )
+            quantized_layers = modelopt_config.get("quantized_layers", {})
+            has_nvfp4 = self.quantization == "modelopt_fp4" or (
+                self.quantization == "modelopt_mixed"
+                and isinstance(quantized_layers, dict)
+                and any(
+                    "NVFP4" in str(layer_config.get("quant_algo", "")).upper()
+                    for layer_config in quantized_layers.values()
+                    if isinstance(layer_config, dict)
+                )
+            )
+            if not has_nvfp4:
+                raise ValueError(
+                    "inc_mxfp4 requires a serialized ModelOpt NVFP4 checkpoint."
+                )
+
         if (
             quant_cfg is not None
-            and requested_quantization == "mxfp4"
+            and requested_quantization in ("mxfp4", "inc_mxfp4")
             and self.quantization in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.quantization_config = resolve_quantization_config(
