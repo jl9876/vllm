@@ -332,6 +332,86 @@ def test_inc_mxfp4_leaves_unquantized_layers_unchanged(
     assert isinstance(layer.quant_method, UnquantizedLinearMethod)
 
 
+def test_inc_mxfp4_routes_modelopt_mixed_layers_by_checkpoint_algo(
+    default_vllm_config, monkeypatch
+):
+    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    for module in (
+        "vllm.model_executor.layers.linear",
+        "vllm.model_executor.parameter",
+    ):
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.online.mxfp4.init_mxfp4_linear_kernel",
+        lambda **kwargs: Mock(),
+    )
+    config = ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.o_proj": {"quant_algo": "FP8"},
+                    "model.layers.0.mlp.shared_expert.gate_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.layers.0.mlp.shared_expert.up_proj": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                    "lm_head": {
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
+                    },
+                },
+            }
+        }
+    )
+    config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+    args = resolve_quantization_config("inc_mxfp4", None)
+    assert args is not None
+    config.online_quantization_config = OnlineQuantizationConfig(args)
+
+    attention = ColumnParallelLinear(
+        input_size=32,
+        output_size=32,
+        bias=False,
+        quant_config=config,
+        prefix="model.layers.0.self_attn.o_proj",
+        disable_tp=True,
+    )
+    assert isinstance(attention.quant_method, Mxfp8OnlineLinearMethod)
+    assert isinstance(
+        attention.quant_method.requantization_source, ModelOptLinearMethod
+    )
+
+    shared_expert = ColumnParallelLinear(
+        input_size=32,
+        output_size=32,
+        bias=False,
+        quant_config=config,
+        prefix="model.layers.0.mlp.shared_expert.gate_up_proj",
+        disable_tp=True,
+    )
+    assert isinstance(shared_expert.quant_method, Mxfp4OnlineLinearMethod)
+
+    head = ParallelLMHead(
+        64,
+        32,
+        disable_tp=True,
+        quant_config=config,
+        prefix="language_model.lm_head",
+    )
+    assert isinstance(head.quant_method, Mxfp4OnlineLinearMethod)
+
+    assert config.online_quantization_config.quantized_layer_summaries == [
+        "language_model.lm_head: 1 (from checkpoint: mxfp4)",
+        "mlp.shared_expert.gate_up_proj: 1 (from checkpoint: mxfp4)",
+        "self_attn.o_proj: 1 (from checkpoint: mxfp8)",
+    ]
+
+
 def test_modelopt_mixed_verifies_residual_checkpoint_backend(
     monkeypatch,
 ):

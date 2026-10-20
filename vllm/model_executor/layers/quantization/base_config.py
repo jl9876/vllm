@@ -227,6 +227,12 @@ class QuantizationConfig(ABC):
         """Return a checkpoint method used only as an online weight source."""
         return self.get_quant_method(layer, prefix)
 
+    def get_checkpoint_quantization_algo(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> str | None:
+        """Return the serialized per-layer algorithm, when available."""
+        return None
+
     def is_checkpoint_layer_quantized(
         self, layer: torch.nn.Module, prefix: str
     ) -> bool:
@@ -352,8 +358,13 @@ def resolve_quant_method(
     quant_config.online_quantization_config.packed_modules_mapping = (
         quant_config.packed_modules_mapping
     )
+    checkpoint_quantization_algo = quant_config.get_checkpoint_quantization_algo(
+        layer, prefix
+    )
     online_target = quant_config.online_quantization_config.resolve_quant_method_cls(
-        type(layer), prefix
+        type(layer),
+        prefix,
+        checkpoint_quantization_algo=checkpoint_quantization_algo,
     )
     if online_target is None:
         if quant_config.is_checkpoint_layer_quantized(layer, prefix):
@@ -373,7 +384,9 @@ def resolve_quant_method(
             return base_quant_method
 
         online_quant_method = quant_config.online_quantization_config.get_quant_method(
-            layer, prefix
+            layer,
+            prefix,
+            checkpoint_quantization_algo=checkpoint_quantization_algo,
         )
 
         assert base_quant_method is not None and not isinstance(

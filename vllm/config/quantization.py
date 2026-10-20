@@ -133,6 +133,9 @@ class QuantizationConfigArgs:
     requantize_only: bool = False
     """Apply online methods only to serialized checkpoint-quantized layers."""
 
+    requantization_targets: dict[str, str] = Field(default_factory=dict)
+    """Online shorthands selected by serialized checkpoint algorithm name."""
+
     @field_validator("linear", "moe", mode="before")
     @classmethod
     def _coerce_spec(cls, v: Any, info: ValidationInfo) -> Any:
@@ -175,6 +178,27 @@ class QuantizationConfigArgs:
                         f"targets key {pattern} is not a valid regex: {e}"
                     ) from e
         return v
+
+    @field_validator("requantization_targets", mode="before")
+    @classmethod
+    def _validate_requantization_targets(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            raise TypeError(
+                f"requantization_targets must be a dict, got {type(v).__name__}"
+            )
+        for algorithm, shorthand in v.items():
+            if not isinstance(algorithm, str):
+                raise ValueError(
+                    "requantization_targets keys must be strings, got "
+                    f"{type(algorithm).__name__}"
+                )
+            if not isinstance(shorthand, str) or shorthand not in _ONLINE_SHORTHANDS:
+                raise ValueError(
+                    f"requantization_targets[{algorithm}] = {shorthand} is not a "
+                    "valid online shorthand name; expected one of "
+                    f"{sorted(_ONLINE_SHORTHANDS)}"
+                )
+        return {algorithm.upper(): shorthand for algorithm, shorthand in v.items()}
 
     @model_validator(mode="after")
     def _validate_targets_exclusivity(self) -> "QuantizationConfigArgs":
@@ -231,6 +255,15 @@ _ONLINE_SHORTHAND_ALIASES: dict[str, QuantizationConfigArgs] = {
         linear=QuantSpec(weight=kMxfp4Static),
         moe=QuantSpec(weight=kMxfp4Static),
         requantize_only=True,
+        requantization_targets={
+            "FP8": "mxfp8",
+            "FP8_PER_CHANNEL_PER_TOKEN": "mxfp8",
+            "FP8_PB_WO": "mxfp8",
+            "FP8_BLOCK_SCALES": "mxfp8",
+            "MXFP8": "mxfp8",
+            "NVFP4": "mxfp4",
+            "W4A16_NVFP4": "mxfp4",
+        },
     ),
 }
 
@@ -298,4 +331,7 @@ def resolve_quantization_config(
         ignore=quantization_config.ignore or base.ignore,
         targets=quantization_config.targets or base.targets,
         requantize_only=quantization_config.requantize_only or base.requantize_only,
+        requantization_targets=(
+            quantization_config.requantization_targets or base.requantization_targets
+        ),
     )

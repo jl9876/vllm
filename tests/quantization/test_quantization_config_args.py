@@ -120,6 +120,15 @@ def test_resolve_inc_mxfp4_alias():
     assert args.linear == QuantSpec(weight=kMxfp4Static)
     assert args.moe == QuantSpec(weight=kMxfp4Static)
     assert args.requantize_only
+    assert args.requantization_targets == {
+        "FP8": "mxfp8",
+        "FP8_PER_CHANNEL_PER_TOKEN": "mxfp8",
+        "FP8_PB_WO": "mxfp8",
+        "FP8_BLOCK_SCALES": "mxfp8",
+        "MXFP8": "mxfp8",
+        "NVFP4": "mxfp4",
+        "W4A16_NVFP4": "mxfp4",
+    }
 
 
 @pytest.mark.parametrize("quantization", ["mxfp4", "mxfp8"])

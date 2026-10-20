@@ -1871,6 +1871,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     ) -> "QuantizeMethodBase | None":
         return self._get_quant_method(layer, prefix, requantization_source=True)
 
+    def get_checkpoint_quantization_algo(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> str | None:
+        if isinstance(layer, (LinearBase, ParallelLMHead, RoutedExperts)):
+            return self._resolve_quant_algo(prefix)
+        return None
+
     def _get_quant_method(
         self,
         layer: torch.nn.Module,

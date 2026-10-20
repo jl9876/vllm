@@ -83,6 +83,7 @@ class OnlineQuantizationSource(str, Enum):
     linear = "linear"  # LinearBase
     moe = "moe"  # RoutedExperts
     targets = "targets"
+    checkpoint = "checkpoint"
 
 
 # Online dispatch tables, keyed by the QuantSpec.weight QuantKey. The
@@ -265,13 +266,19 @@ class OnlineQuantizationConfig(QuantizationConfig):
         return cls
 
     def resolve_quant_method_cls(
-        self, layer_cls: type[torch.nn.Module], prefix: str
+        self,
+        layer_cls: type[torch.nn.Module],
+        prefix: str,
+        *,
+        checkpoint_quantization_algo: str | None = None,
     ) -> tuple[OnlineQuantizationSource, str, str | None, QuantSpec, type] | None:
         """Resolve quantization metadata and method class without instantiating it.
 
         Args:
             layer_cls: Type of layer for which to resolve online quantization.
             prefix: Fully qualified layer name.
+            checkpoint_quantization_algo: Serialized per-layer algorithm used to
+                select a source-aware requantization target.
 
         Returns:
             A tuple of source, quantization key string, target pattern, spec,
@@ -287,6 +294,33 @@ class OnlineQuantizationConfig(QuantizationConfig):
             if resolved_pattern is None:
                 return None
             source, quant_key_str, target_pattern, quant_spec, table = resolved_pattern
+        elif (
+            checkpoint_quantization_algo is not None
+            and (
+                quant_key_str := self.args.requantization_targets.get(
+                    checkpoint_quantization_algo.upper()
+                )
+            )
+            is not None
+        ):
+            source = OnlineQuantizationSource.checkpoint
+            target_pattern = None
+            shorthand = _ONLINE_SHORTHANDS[quant_key_str]
+            if issubclass(layer_cls, (LinearBase, ParallelLMHead)):
+                quant_spec = shorthand.linear
+                table = _ONLINE_LINEAR_METHODS
+            elif issubclass(layer_cls, RoutedExperts):
+                quant_spec = shorthand.moe
+                table = _ONLINE_MOE_METHODS
+            else:
+                return None
+            if should_ignore_layer(
+                prefix,
+                ignore=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+                use_fnmatch=True,
+            ):
+                return None
         else:
             if issubclass(layer_cls, (LinearBase, ParallelLMHead)):
                 source = OnlineQuantizationSource.linear
@@ -401,10 +435,18 @@ class OnlineQuantizationConfig(QuantizationConfig):
         )
 
     def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+        *,
+        checkpoint_quantization_algo: str | None = None,
     ) -> "QuantizeMethodBase | None":
         # `targets` takes precedence over `moe` and `linear` and is exclusive.
-        resolved = self.resolve_quant_method_cls(type(layer), prefix)
+        resolved = self.resolve_quant_method_cls(
+            type(layer),
+            prefix,
+            checkpoint_quantization_algo=checkpoint_quantization_algo,
+        )
         if resolved is not None:
             source, quant_key_str, target_pattern, _, quant_method_cls = resolved
             self.quantized_layers[prefix] = (
