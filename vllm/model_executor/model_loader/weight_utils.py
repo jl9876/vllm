@@ -205,6 +205,8 @@ def get_quant_config(
         resolve_quantization_config,
     )
     from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+        ModelOptNvFp4Config,
         ModelOptQuantConfigBase,
     )
     from vllm.model_executor.layers.quantization.online.base import (
@@ -221,6 +223,19 @@ def get_quant_config(
         if online_args is None:
             return checkpoint_config
         assert isinstance(online_args, QuantizationConfigArgs)
+
+        if online_args.require_nvfp4_checkpoint:
+            has_nvfp4 = isinstance(checkpoint_config, ModelOptNvFp4Config) or (
+                isinstance(checkpoint_config, ModelOptMixedPrecisionConfig)
+                and any(
+                    recipe.get("quant_algo", "").upper() in ("NVFP4", "W4A16_NVFP4")
+                    for recipe in checkpoint_config.quantized_layers.values()
+                )
+            )
+            if not has_nvfp4:
+                raise ValueError(
+                    "inc_mxfp4 requires a serialized ModelOpt NVFP4 checkpoint."
+                )
 
         checkpoint_config.online_quantization_config = OnlineQuantizationConfig(
             online_args

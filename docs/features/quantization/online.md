@@ -145,18 +145,37 @@ vllm serve nvidia/Qwen3-30B-A3B-NVFP4 \
     --quantization mxfp4
 ```
 
-On XPU, `--quantization inc_mxfp4` enables this conversion for serialized
-ModelOpt NVFP4 checkpoints. For ModelOpt mixed-precision checkpoints, it
-automatically converts FP8-family layers to MXFP8 and NVFP4-family layers to
-MXFP4. Unquantized layers remain unchanged.
+On XPU, `--quantization inc_mxfp4` selects a checkpoint-only conversion policy
+for serialized ModelOpt NVFP4 checkpoints, including mixed-precision checkpoints
+containing NVFP4 weights. Both inline checkpoint metadata and legacy
+`hf_quant_config.json` metadata are supported.
 
-Use `targets` to override the automatic conversion for selected layers.
-Unmatched layers retain the checkpoint backend. Fused shared experts and tied
-`lm_head` weights are not supported.
+Its automatic conversion supports:
+
+| Checkpoint layer | Online target |
+| ---------------- | ------------- |
+| ModelOpt FP8 (per-tensor), FP8_PB_WO, or MXFP8 linear | MXFP8 |
+| ModelOpt NVFP4 or W4A16_NVFP4 linear, untied lm_head, or MoE | MXFP4 |
+
+Per-channel FP8 linears and FP8/MXFP8 MoE sources are not supported for
+re-quantization. Unsupported sources raise an error; exclude them through
+`quantization_config.ignore` only if their checkpoint backend supports the device.
+
+Explicit `linear` or `moe` specs override automatic target selection for that
+layer type. Alternatively, use `targets` to convert only selected layers.
+Unmatched layers retain the checkpoint backend, which is verified separately.
+Unquantized layers remain unchanged with `inc_mxfp4`, including when `targets`
+are supplied. `ignore: ["lm_head"]` also matches a prefixed output head such as
+`language_model.lm_head`. Fused shared experts and tied re-quantized `lm_head`
+weights are not supported.
+
+Ordinary online quantization does not select an unquantized `lm_head` through
+the global `linear` spec; use an explicit `targets` entry to opt in.
 
 The target backend determines activation precision; XPU may use BF16
-activations. Without `targets`, unquantized linear layers, including router
-gates, are also quantized unless excluded through `quantization_config.ignore`.
+activations. With `--quantization mxfp4` (not `inc_mxfp4`), unquantized linear
+layers, including router gates, are also quantized unless excluded through
+`quantization_config.ignore` or left unmatched by `targets`.
 Conversion can introduce additional quantization error, increase peak loading
 memory, and does not export a checkpoint.
 

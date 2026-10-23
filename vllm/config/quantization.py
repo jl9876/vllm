@@ -133,6 +133,9 @@ class QuantizationConfigArgs:
     requantize_only: bool = False
     """Apply online methods only to serialized checkpoint-quantized layers."""
 
+    require_nvfp4_checkpoint: bool = False
+    """Require ModelOpt NVFP4 weights after loading the full checkpoint config."""
+
     requantization_targets: dict[str, str] = Field(default_factory=dict)
     """Online shorthands selected by serialized checkpoint algorithm name."""
 
@@ -252,14 +255,11 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
 
 _ONLINE_SHORTHAND_ALIASES: dict[str, QuantizationConfigArgs] = {
     "inc_mxfp4": QuantizationConfigArgs(
-        linear=QuantSpec(weight=kMxfp4Static),
-        moe=QuantSpec(weight=kMxfp4Static),
         requantize_only=True,
+        require_nvfp4_checkpoint=True,
         requantization_targets={
             "FP8": "mxfp8",
-            "FP8_PER_CHANNEL_PER_TOKEN": "mxfp8",
             "FP8_PB_WO": "mxfp8",
-            "FP8_BLOCK_SCALES": "mxfp8",
             "MXFP8": "mxfp8",
             "NVFP4": "mxfp4",
             "W4A16_NVFP4": "mxfp4",
@@ -307,7 +307,7 @@ def resolve_quantization_config(
             return QuantizationConfigArgs(**quantization_config)
         return quantization_config
 
-    base = _ONLINE_SHORTHAND_ALIASES.get(quantization)
+    base = _ONLINE_SHORTHAND_ALIASES.get(quantization) if quantization else None
     if base is None:
         base = _ONLINE_SHORTHANDS.get(quantization) if quantization else None
 
@@ -322,15 +322,24 @@ def resolve_quantization_config(
     if base is None:
         return quantization_config
 
-    if quantization_config.targets is not None:
-        return quantization_config
-
     return QuantizationConfigArgs(
-        linear=quantization_config.linear or base.linear,
-        moe=quantization_config.moe or base.moe,
+        linear=(
+            quantization_config.linear or base.linear
+            if quantization_config.targets is None
+            else None
+        ),
+        moe=(
+            quantization_config.moe or base.moe
+            if quantization_config.targets is None
+            else None
+        ),
         ignore=quantization_config.ignore or base.ignore,
         targets=quantization_config.targets or base.targets,
         requantize_only=quantization_config.requantize_only or base.requantize_only,
+        require_nvfp4_checkpoint=(
+            quantization_config.require_nvfp4_checkpoint
+            or base.require_nvfp4_checkpoint
+        ),
         requantization_targets=(
             quantization_config.requantization_targets or base.requantization_targets
         ),

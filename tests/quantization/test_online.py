@@ -185,6 +185,16 @@ def test_online_nvfp4_linear_requantization_preserves_partition_scales():
     expected = torch.tensor([2.0] * 4 + [3.0] * 2 + [5.0] * 2)
     torch.testing.assert_close(actual.float(), expected[:, None].expand(8, 32))
 
+    layer.weight_scale.data[0, 0] = 0
+    actual = method.requantization_source.dequantize_weight(layer)
+    assert isinstance(actual, torch.Tensor)
+    assert torch.count_nonzero(actual[0, :16]) == 0
+    torch.testing.assert_close(actual[0, 16:].float(), torch.full((16,), 2.0))
+    layer.weight_scale.data[0, 0] = -1
+    with pytest.raises(ValueError, match="non-negative"):
+        method.requantization_source.dequantize_weight(layer)
+    layer.weight_scale.data[0, 0] = 1
+
     layer.weight_scale_2.data[0] = 0
     with pytest.raises(ValueError, match="finite positive scales"):
         method.requantization_source.dequantize_weight(layer)
@@ -232,104 +242,6 @@ def test_modelopt_nvfp4_mxfp4_shorthand_preserves_checkpoint_source(requested):
         )
         expected = ["inc_mxfp4", "online"] if requested == "inc_mxfp4" else ["online"]
         assert [call.args[0] for call in verify.call_args_list] == expected
-
-
-def test_inc_mxfp4_rejects_non_xpu():
-    model_config = SimpleNamespace(
-        quantization="inc_mxfp4",
-        quantization_config=None,
-        model_arch_config=SimpleNamespace(quantization_config=None),
-        hf_config=SimpleNamespace(),
-    )
-    from unittest.mock import patch
-
-    with (
-        patch.object(current_platform, "is_xpu", return_value=False),
-        pytest.raises(ValueError, match="only supported on XPU"),
-    ):
-        ModelConfig._verify_quantization(model_config)
-
-
-def test_inc_mxfp4_requires_modelopt_nvfp4():
-    model_config = SimpleNamespace(
-        quantization="inc_mxfp4",
-        quantization_config=None,
-        model_arch_config=SimpleNamespace(quantization_config=None),
-        hf_config=SimpleNamespace(),
-    )
-    from unittest.mock import patch
-
-    with (
-        patch.object(current_platform, "is_xpu", return_value=True),
-        patch.object(current_platform, "verify_quantization"),
-        pytest.raises(ValueError, match="requires a serialized ModelOpt NVFP4"),
-    ):
-        ModelConfig._verify_quantization(model_config)
-
-
-def test_inc_mxfp4_accepts_modelopt_mixed_nvfp4():
-    quantization_config = {
-        "quant_method": "modelopt",
-        "quant_algo": "MIXED_PRECISION",
-        "quantized_layers": {
-            "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
-            "model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4"},
-        },
-    }
-    model_config = SimpleNamespace(
-        quantization="inc_mxfp4",
-        quantization_config=None,
-        model_arch_config=SimpleNamespace(quantization_config=quantization_config),
-        hf_config=SimpleNamespace(),
-    )
-    from unittest.mock import patch
-
-    with (
-        patch.object(current_platform, "is_xpu", return_value=True),
-        patch.object(current_platform, "verify_quantization"),
-    ):
-        ModelConfig._verify_quantization(model_config)
-
-    assert model_config.quantization == "modelopt_mixed"
-    assert model_config.quantization_config == resolve_quantization_config(
-        "inc_mxfp4", {}
-    )
-
-
-def test_inc_mxfp4_leaves_unquantized_layers_unchanged(
-    default_vllm_config, monkeypatch
-):
-    default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
-    for module in (
-        "vllm.model_executor.layers.linear",
-        "vllm.model_executor.parameter",
-    ):
-        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_rank", lambda: 0)
-        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
-    config = ModelOptMixedPrecisionConfig.from_config(
-        {
-            "quantization": {
-                "quant_algo": "MIXED_PRECISION",
-                "quantized_layers": {
-                    "model.layers.0.self_attn.o_proj": {"quant_algo": "FP8"}
-                },
-            }
-        }
-    )
-    args = resolve_quantization_config("inc_mxfp4", None)
-    assert args is not None
-    config.online_quantization_config = OnlineQuantizationConfig(args)
-
-    layer = ColumnParallelLinear(
-        input_size=32,
-        output_size=32,
-        bias=False,
-        quant_config=config,
-        prefix="model.layers.0.mlp.gate",
-        disable_tp=True,
-    )
-
-    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
 
 
 def test_inc_mxfp4_routes_modelopt_mixed_layers_by_checkpoint_algo(
@@ -410,35 +322,6 @@ def test_inc_mxfp4_routes_modelopt_mixed_layers_by_checkpoint_algo(
         "mlp.shared_expert.gate_up_proj: 1 (from checkpoint: mxfp4)",
         "self_attn.o_proj: 1 (from checkpoint: mxfp8)",
     ]
-
-
-def test_modelopt_mixed_verifies_residual_checkpoint_backend(
-    monkeypatch,
-):
-    prefix = "model.layers.0.self_attn.o_proj"
-    quant_config = ModelOptMixedPrecisionConfig.from_config(
-        {
-            "quantization": {
-                "quant_algo": "MIXED_PRECISION",
-                "quantized_layers": {prefix: {"quant_algo": "FP8"}},
-            }
-        }
-    )
-    quant_config.online_quantization_config = OnlineQuantizationConfig(
-        quant_config_args(targets={"lm_head": "mxfp4"})
-    )
-    verify = Mock()
-    monkeypatch.setattr(current_platform, "verify_quantization", verify)
-    layer = object.__new__(ColumnParallelLinear)
-
-    from vllm.model_executor.layers.quantization.base_config import (
-        resolve_quant_method,
-    )
-
-    method = resolve_quant_method(quant_config, layer, prefix)
-
-    assert isinstance(method, ModelOptLinearMethod)
-    verify.assert_called_once_with("modelopt_mixed")
 
 
 @pytest.mark.parametrize("algo", ["FP8", "FP8_PB_WO"])

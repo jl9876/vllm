@@ -150,6 +150,14 @@ def _find_matching_targets(
     return [matched_patterns[0]]
 
 
+def _online_layer_prefix_candidates(
+    layer_cls: type[torch.nn.Module], prefix: str
+) -> tuple[str, ...]:
+    if issubclass(layer_cls, ParallelLMHead) and prefix.endswith(".lm_head"):
+        return prefix, "lm_head"
+    return (prefix,)
+
+
 class OnlineQuantizationConfig(QuantizationConfig):
     """Model-level config for online quantization (quantize fp16/bf16 weights
     during model loading, without requiring a pre-quantized checkpoint)."""
@@ -159,11 +167,17 @@ class OnlineQuantizationConfig(QuantizationConfig):
         args: QuantizationConfigArgs,
     ) -> None:
         super().__init__()
-        if args.linear is None and args.moe is None and args.targets is None:
+        if (
+            args.linear is None
+            and args.moe is None
+            and args.targets is None
+            and not args.requantization_targets
+        ):
             raise ValueError(
                 "OnlineQuantizationConfig requires at least one of "
                 "quantization_config.linear, quantization_config.moe, or "
-                "quantization_config.targets to be set."
+                "quantization_config.targets or "
+                "quantization_config.requantization_targets to be set."
             )
         self.args = args
         self.ignored_layers: list[str] = args.ignore
@@ -286,6 +300,22 @@ class OnlineQuantizationConfig(QuantizationConfig):
             apply to the layer.
 
         """
+        if (
+            issubclass(layer_cls, ParallelLMHead)
+            and checkpoint_quantization_algo not in ("NVFP4", "W4A16_NVFP4")
+            and self.args.targets is None
+        ):
+            return None
+        if self.args.targets is None and any(
+            should_ignore_layer(
+                candidate,
+                ignore=self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+                use_fnmatch=True,
+            )
+            for candidate in _online_layer_prefix_candidates(layer_cls, prefix)
+        ):
+            return None
         quant_spec: QuantSpec | None
         if self.args.targets is not None:
             resolved_pattern = self._resolve_targets_quant_method_metadata(
@@ -296,13 +326,25 @@ class OnlineQuantizationConfig(QuantizationConfig):
             source, quant_key_str, target_pattern, quant_spec, table = resolved_pattern
         elif (
             checkpoint_quantization_algo is not None
+            and self.args.requantization_targets
             and (
-                quant_key_str := self.args.requantization_targets.get(
-                    checkpoint_quantization_algo.upper()
+                (
+                    issubclass(layer_cls, (LinearBase, ParallelLMHead))
+                    and self.args.linear is None
                 )
+                or (issubclass(layer_cls, RoutedExperts) and self.args.moe is None)
             )
-            is not None
         ):
+            checkpoint_target = self.args.requantization_targets.get(
+                checkpoint_quantization_algo.upper()
+            )
+            if checkpoint_target is None:
+                raise ValueError(
+                    f"Automatic requantization of ModelOpt "
+                    f"{checkpoint_quantization_algo} at {prefix} is not supported. "
+                    "Use quantization_config.ignore to retain its checkpoint backend."
+                )
+            quant_key_str = checkpoint_target
             source = OnlineQuantizationSource.checkpoint
             target_pattern = None
             shorthand = _ONLINE_SHORTHANDS[quant_key_str]
@@ -313,13 +355,6 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 quant_spec = shorthand.moe
                 table = _ONLINE_MOE_METHODS
             else:
-                return None
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-                use_fnmatch=True,
-            ):
                 return None
         else:
             if issubclass(layer_cls, (LinearBase, ParallelLMHead)):
@@ -333,13 +368,6 @@ class OnlineQuantizationConfig(QuantizationConfig):
             else:
                 return None
 
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-                use_fnmatch=True,
-            ):
-                return None
             quant_key_str = str(quant_spec)
             target_pattern = None
 
@@ -368,9 +396,7 @@ class OnlineQuantizationConfig(QuantizationConfig):
 
         """
         assert self.args.targets is not None
-        prefix_candidates = [prefix]
-        if issubclass(layer_cls, ParallelLMHead) and prefix.endswith(".lm_head"):
-            prefix_candidates.append("lm_head")
+        prefix_candidates = _online_layer_prefix_candidates(layer_cls, prefix)
         ignored = any(
             should_ignore_layer(
                 candidate,

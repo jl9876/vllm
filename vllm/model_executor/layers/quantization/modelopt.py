@@ -275,6 +275,46 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         return None
 
+    def get_checkpoint_quantization_algo(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> str | None:
+        if self.is_checkpoint_layer_quantized(layer, prefix) and isinstance(
+            layer, (LinearBase, ParallelLMHead, RoutedExperts)
+        ):
+            return self.quant_method.upper()
+        return None
+
+    def _validate_requantization_source(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> None:
+        algorithm = self.get_checkpoint_quantization_algo(layer, prefix)
+        supported = (
+            ("NVFP4", "W4A16_NVFP4")
+            if isinstance(layer, (ParallelLMHead, RoutedExperts))
+            else ("FP8", "FP8_PB_WO", "MXFP8", "NVFP4", "W4A16_NVFP4")
+        )
+        if algorithm is not None and algorithm not in supported:
+            raise ValueError(
+                f"ModelOpt {algorithm} requantization for "
+                f"{type(layer).__name__} at {prefix} is not supported. "
+                f"Supported source algorithms: {supported}. "
+                "Use quantization_config.ignore to retain its checkpoint backend."
+            )
+
+    def get_quant_method_for_requantization(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        self._validate_requantization_source(layer, prefix)
+        if (
+            isinstance(self, ModelOptNvFp4Config)
+            and isinstance(layer, RoutedExperts)
+            and not self.is_layer_excluded(prefix)
+        ):
+            return ModelOptNvFp4FusedMoE(
+                self, layer.moe_config, requantization_source=True
+            )
+        return self.get_quant_method(layer, prefix)
+
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         if len(self.exclude_modules) > 0:
             # This is a workaround for the weights remapping issue:
@@ -1047,6 +1087,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """Convert NVFP4 MoE weights into kernel format and setup the kernel."""
+        assert self.nvfp4_backend is not None
         if is_weights_pre_processed():
             if self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
                 raise RuntimeError(
@@ -1112,6 +1153,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
         """Build the modular MoE kernel from the (already in-format) weights."""
+        assert self.nvfp4_backend is not None
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.experts_cls is not None
         self.moe_kernel = make_nvfp4_moe_kernel(
@@ -1135,6 +1177,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         mc.intermediate_size_per_partition = layer.w2_weight.shape[2] * 2
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+        assert self.nvfp4_backend is not None
         return make_nvfp4_moe_quant_config(
             backend=self.nvfp4_backend,
             w13_scale=layer.w13_weight_scale,
@@ -1869,12 +1912,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     def get_quant_method_for_requantization(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        self._validate_requantization_source(layer, prefix)
         return self._get_quant_method(layer, prefix, requantization_source=True)
 
     def get_checkpoint_quantization_algo(
         self, layer: torch.nn.Module, prefix: str
     ) -> str | None:
-        if isinstance(layer, (LinearBase, ParallelLMHead, RoutedExperts)):
+        if not self.is_layer_excluded(prefix) and isinstance(
+            layer, (LinearBase, ParallelLMHead, RoutedExperts)
+        ):
             return self._resolve_quant_algo(prefix)
         return None
 

@@ -11,6 +11,7 @@ from vllm.config.quantization import (
     QuantSpec,
     resolve_quantization_config,
 )
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
@@ -23,7 +24,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kInt4Static32,
     kInt8StaticChannelSym,
-    kMxfp4Static,
     kMxfp8Dynamic,
     kNvfp4DynamicToken,
     kNvfp4Static,
@@ -117,18 +117,37 @@ def test_resolve_shorthand_only_populates_both_slots():
 def test_resolve_inc_mxfp4_alias():
     args = resolve_quantization_config("inc_mxfp4", None)
     assert args is not None
-    assert args.linear == QuantSpec(weight=kMxfp4Static)
-    assert args.moe == QuantSpec(weight=kMxfp4Static)
+    assert args.linear is None
+    assert args.moe is None
     assert args.requantize_only
     assert args.requantization_targets == {
         "FP8": "mxfp8",
-        "FP8_PER_CHANNEL_PER_TOKEN": "mxfp8",
         "FP8_PB_WO": "mxfp8",
-        "FP8_BLOCK_SCALES": "mxfp8",
         "MXFP8": "mxfp8",
         "NVFP4": "mxfp4",
         "W4A16_NVFP4": "mxfp4",
     }
+
+
+def test_resolve_inc_mxfp4_targets_preserve_checkpoint_only_policy():
+    args = resolve_quantization_config("inc_mxfp4", {"targets": {"lm_head": "mxfp4"}})
+    assert args is not None
+    assert args.requantize_only
+    assert args.linear is None and args.moe is None
+    assert args.targets == {"lm_head": "mxfp4"}
+
+
+@pytest.mark.parametrize(
+    "slot,layer_cls", [("linear", LinearBase), ("moe", RoutedExperts)]
+)
+def test_resolve_inc_mxfp4_explicit_spec_overrides_automatic_target(slot, layer_cls):
+    args = resolve_quantization_config("inc_mxfp4", {slot: "fp8_per_tensor"})
+    assert args is not None
+    result = OnlineQuantizationConfig(args).resolve_quant_method_cls(
+        layer_cls, "proj", checkpoint_quantization_algo="NVFP4"
+    )
+    assert result is not None
+    assert result[3] == QuantSpec(weight=kFp8StaticTensorSym)
 
 
 @pytest.mark.parametrize("quantization", ["mxfp4", "mxfp8"])

@@ -88,11 +88,8 @@ class _ModelOptNvfp4LinearSource(QuantizeMethodBase):
                 "ModelOpt NVFP4 active rows do not match weight rows: "
                 f"active_rows={active_rows}, weight_shape={tuple(layer.weight.shape)}"
             )
-        require_finite_positive_scales(
-            "ModelOpt NVFP4 weight_scale", weight_scale[:active_rows]
-        )
-        if (weight_scale[active_rows:] < 0).any():
-            raise ValueError("ModelOpt NVFP4 padding weight_scale must be non-negative")
+        if (weight_scale < 0).any():
+            raise ValueError("ModelOpt NVFP4 weight_scale must be non-negative")
         require_finite_positive_scales(
             "ModelOpt NVFP4 weight_scale_2", layer.weight_scale_2
         )
